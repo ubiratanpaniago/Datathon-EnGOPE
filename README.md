@@ -34,7 +34,7 @@ Prazo de submissão: **21/10 às 19h00**. Enviar por e-mail um PDF de até 10 p�
 
 ## Como executar
 
-**Forma mais simples (arquivo único, enviado na submissão):** `pip install pandas numpy` e `python solucao_datathon.py`, com os CSVs em `dados/`. O script reproduz todos os resultados de `resultados/` em menos de 1 minuto. Com `matplotlib` instalado, também salva os 8 gráficos em `figuras/` (sem ele, os gráficos são pulados e os resultados não mudam).
+**Forma mais simples (arquivo único, enviado na submissão):** `pip install pandas numpy scipy statsmodels` e `python solucao_datathon.py`, com os CSVs em `dados/`. O script reproduz todos os resultados de `resultados/` em cerca de 2 minutos (inclui a auditoria dos dados e as extensões do notebook 06). Com `matplotlib` instalado, também salva os 8 gráficos em `figuras/` (sem ele, os gráficos são pulados e os resultados não mudam).
 
 **Notebooks (com gráficos e texto):**
 

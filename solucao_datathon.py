@@ -5,7 +5,7 @@ Solução completa em um único arquivo: Trilha 1 (rotatividade), Trilha 2 (folg
 Trilha 3 (escala 6x1 para 5x2) e modelo integrado com impacto em R$.
 
 COMO EXECUTAR
-    pip install "pandas>=2.2" "numpy>=1.26"      (Python 3.10 ou superior)
+    pip install pandas numpy scipy statsmodels      (Python 3.10 ou superior; matplotlib é opcional)
     python solucao_datathon.py
 
     Os CSVs fornecidos pela organização devem estar na pasta `dados/`, ao lado deste arquivo.
@@ -15,20 +15,26 @@ COMO EXECUTAR
     Sem o matplotlib, o script roda normalmente e só pula os gráficos.
 
 ORGANIZAÇÃO DO ARQUIVO
-    Parte A. Funções reutilizáveis (rotatividade, ausências, escala, modelo integrado).
+    Parte A. Funções reutilizáveis (rotatividade, ausências, escala, modelo integrado) e auditoria dos dados.
     Parte B. Trilha 1: série mensal, diagnóstico, backtest de estratégias e projeção.
     Parte C. Trilha 2: classificação e limpeza do ponto, taxas por causa, validação, reserva e quadro extra.
     Parte D. Trilha 3: jornada praticada por escala, cenários e quadro adicional.
     Parte E. Modelo integrado: as três trilhas numa base única (a posição) e o custo em reais.
+    Parte F. Extensões: faixas da T1 validadas fora da amostra, estimador bayesiano empírico, reserva da T2
+             escolhida por custo esperado e efeito da escala sobre a rotatividade (modelo de Poisson).
 
     O texto explicativo de cada etapa aparece como comentário antes do código correspondente.
     A mesma análise, com gráficos, está nos notebooks do repositório da equipe (os comentários citam
-    "notebook 02" a "notebook 05": correspondem às Partes B a E deste arquivo).
+    "notebook 02" a "notebook 06": correspondem às Partes B a F deste arquivo).
 """
 import os
 import sys
+import warnings
 import numpy as np
 import pandas as pd
+from scipy.stats import binom              # reserva por custo esperado (Parte F)
+import statsmodels.api as sm               # modelo de Poisson da escala x rotatividade (Parte F)
+warnings.filterwarnings('ignore')
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))   # executa a partir da pasta do script (dados/ e resultados/ ao lado)
 os.makedirs('resultados', exist_ok=True)
@@ -97,7 +103,11 @@ def turnover_janela(janela):
 
 
 def taxa_anual(historico, meses):
-    """Turnover anual equivalente, estimado como a taxa mensal agregada dos últimos `meses` × 12."""
+    """Turnover mensal anualizado: taxa mensal agregada dos últimos `meses` × 12.
+
+    Usa o headcount de cada mês. Não é a fórmula do enunciado aplicada a um ano inteiro (ver
+    `turnover_periodo`), que usa como denominador todos os vínculos do ano e dá valores menores.
+    """
     w = historico.tail(meses)
     return (w.adm + w.resc).sum() / 2 / w.hc.sum() * 100 * 12
 
@@ -147,8 +157,29 @@ def simular_coorte(integrantes, historico, empresa, origem, risco, meses=12, adm
         sai = n * h
         adm = sai.sum() if adm_mensal is None else adm_mensal
         saida.append((adm, sai.sum(), n.sum() + adm))
-        n = np.concatenate([[adm], (n - sai)[:-1]])
+        n = envelhecer(n - sai, adm)
     return pd.DataFrame(saida, columns=['adm', 'resc', 'hc'])
+
+
+def envelhecer(n, entradas):
+    """Avança um mês de casa: entradas vão para o compartimento 0; o último (199+ meses) acumula quem chega a ele."""
+    novo = np.concatenate([[entradas], n[:-1]])
+    novo[-1] += n[-1]
+    return novo
+
+
+def turnover_periodo(integrantes, empresa, inicio, fim):
+    """Turnover (%) pela fórmula do enunciado aplicada ao período inteiro [inicio, fim].
+
+    Headcount = vínculos com algum dia de vínculo no período. Para um ano, o denominador inclui todos os
+    que passaram pela empresa no ano, e o valor fica abaixo da taxa mensal anualizada (`taxa_anual`).
+    """
+    ini, fim = pd.Timestamp(inicio), pd.Timestamp(fim)
+    g = integrantes[integrantes.CODCOLIGADA == empresa]
+    adm = g.DATAADMISSAO.between(ini, fim).sum()
+    resc = g.DATADEMISSAO.between(ini, fim).sum()
+    hc = ((g.DATAADMISSAO <= fim) & (g.DATADEMISSAO.isna() | (g.DATADEMISSAO >= ini))).sum()
+    return np.nan if not hc else (adm + resc) / 2 / hc * 100
 
 # ---------------------------------------------------------------- funções: ausencias
 """Funções da Trilha 2 (folguistas e feristas).
@@ -326,7 +357,7 @@ def participacao_elegivel(tempo_meses, risco_faixa, meses=36):
     for _ in range(meses):
         saida.append(n[12:].sum() / n.sum())
         sai = n * h
-        n = np.concatenate([[sai.sum()], (n - sai)[:-1]])
+        n = envelhecer(n - sai, sai.sum())
     return np.array(saida)
 
 # ---------------------------------------------------------------- funções: escala
@@ -443,6 +474,238 @@ def custo_anual(pessoas, salario_mensal, encargos=1.0):
     """Custo anual em R$: pessoas x salário x 12 x multiplicador de encargos (1,0 = só salário)."""
     return pessoas * salario_mensal * 12 * encargos
 
+# ---------------------------------------------------------------- funções: rotatividade_eb
+"""Trilha 1: encolhimento bayesiano empírico entre empresas e faixas calibradas fora da amostra.
+
+Modelo gama-Poisson para a taxa de cada empresa, r_e = y_e / E_e, com y = (admissões + rescisões) / 2 e
+E = soma do headcount mensal. Estimativa encolhida: (y_e + m b) / (E_e + b), com m a taxa do grupo e
+b = m / tau2, tau2 a variância entre empresas (momentos).
+"""
+
+
+def taxas_eb(S, origem, meses=36):
+    """Turnover anual (%) bruto e encolhido de cada empresa, com dados até `origem`."""
+    lin = []
+    for e, s in S.items():
+        w = s[s.mes <= origem].tail(meses)
+        if w.hc.sum() > 0:
+            lin.append((e, (w.adm + w.resc).sum() / 2, w.hc.sum()))
+    t = pd.DataFrame(lin, columns=['empresa', 'y', 'E']).set_index('empresa')
+    r = t.y / t.E
+    m = t.y.sum() / t.E.sum()
+    tau2 = max(np.average((r - m) ** 2, weights=t.E) - m * len(t) / t.E.sum(), 1e-12)
+    b = m / tau2
+    return ((t.y + m * b) / (t.E + b) * 1200).rename('eb'), (r * 1200).rename('bruta'), b
+
+
+def backtest_eb(S, H, inicio='2019-12-01', fim='2026-09-01', empresas=(3, 5, 6, 7, 8)):
+    """Projeção (média 36m e encolhida) x turnover realizado nos H meses seguintes, por origem."""
+    lin = []
+    for o in pd.date_range(inicio, pd.Timestamp(fim) - pd.DateOffset(months=H), freq='MS'):
+        eb, _, _ = taxas_eb(S, o)
+        for e in empresas:
+            h = S[e][S[e].mes <= o]
+            f = S[e][(S[e].mes > o) & (S[e].mes <= o + pd.DateOffset(months=H))]
+            if len(f) < H or h.hc.tail(12).mean() < 20 or e not in eb.index:
+                continue
+            lin.append({'empresa': e, 'origem': o, 'H': H, 'real': turnover_janela(f) * 12 / H,
+                        'media36': taxa_anual(h, 36), 'eb36': eb[e]})
+    return pd.DataFrame(lin)
+
+
+def faixa_lognormal(razoes_empresa, razoes_grupo, z=1.2816, n0=12):
+    """Faixa da razão realizado/projetado em escala log, com centro e dispersão da empresa encolhidos
+    para os do grupo (peso n/(n + n0)). z = 1,2816 corresponde a P10-P90."""
+    la = np.log(np.clip(razoes_empresa, .05, 20))   # razão 0 (sem movimento) não pode ir ao log
+    lg = np.log(np.clip(razoes_grupo, .05, 20))
+    w = len(la) / (len(la) + n0)
+    centro = w * (la.median() if len(la) else 0) + (1 - w) * lg.median()
+    sd = np.sqrt(w * (la.var() if len(la) > 1 else 0) + (1 - w) * lg.var())
+    return np.exp(centro - z * sd), np.exp(centro), np.exp(centro + z * sd)
+
+
+def _passado(bt, r):
+    return bt[bt.origem + pd.DateOffset(months=int(r.H)) <= r.origem]
+
+
+def cobertura_lognormal(bt, metodo='media36', z=1.2816, min_hist=24):
+    """Cobertura fora da amostra da faixa log-normal: em cada origem, só usa horizontes já encerrados."""
+    bt = bt.assign(razao=bt.real / bt[metodo])
+    saida = []
+    for r in bt.itertuples():
+        p = _passado(bt, r)
+        if len(p) >= min_hist:
+            lo, _, hi = faixa_lognormal(p[p.empresa == r.empresa].razao, p.razao, z)
+            saida.append({'empresa': r.empresa, 'fora': lo <= r.razao <= hi})
+    return pd.DataFrame(saida)
+
+
+def cobertura_faixa(bt, metodo='media36', q=(.1, .9), min_hist=12):
+    """Cobertura da faixa por quantis de cada empresa (método do notebook 02), calibrada com todas as
+    origens ('dentro') ou só com horizontes já encerrados ('fora')."""
+    bt = bt.assign(razao=bt.real / bt[metodo])
+    saida = []
+    for e, g in bt.groupby('empresa'):
+        lo_in, hi_in = g.razao.quantile(q[0]), g.razao.quantile(q[1])
+        for r in g.itertuples():
+            p = _passado(g, r)
+            if len(p) >= min_hist:
+                lo, hi = p.razao.quantile(q[0]), p.razao.quantile(q[1])
+                saida.append({'empresa': e, 'dentro': lo_in <= r.razao <= hi_in, 'fora': lo <= r.razao <= hi})
+    return pd.DataFrame(saida)
+
+# ---------------------------------------------------------------- funções: reserva_custo
+"""Trilha 2: reserva para ausência curta escolhida pelo menor custo esperado.
+
+Num dia com taxa de ausência p, escalam-se Q titulares e R reservas, e cada um falta com probabilidade p
+(a reserva também falta). Postos descobertos: U = max(0, Q - S), S ~ Binomial(Q + R, 1 - p).
+Custo diário em pessoa-dia: R + k E[U], com k o custo de um posto descoberto.
+"""
+from scipy.stats import binom
+
+
+def deficit_dia(Q, R, p):
+    """E[U] e P(U > 0) num dia com taxa de ausência p."""
+    n = Q + R
+    teto = int(min(n, n * p + 12 * (np.sqrt(n * p * (1 - p)) + 1)))
+    j = np.arange(R, teto + 1)
+    return (binom.sf(j, n, p).sum() if len(j) else 0.0), binom.sf(R, n, p)   # E[(D - R)+] = soma P(D > j)
+
+
+def avaliar(Q, R, ps):
+    """Média sobre os dias observados (ps): postos descobertos por dia, P(algum descoberto) e atendimento."""
+    r = np.array([deficit_dia(Q, R, p) for p in ps])
+    eu = r[:, 0].mean()
+    return {'E_descobertos_dia': eu, 'P_algum_descoberto': r[:, 1].mean(), 'atendimento': 1 - eu / Q}
+
+
+def reserva_otima(Q, ps, k, R0=0):
+    """R inteiro de menor custo R + k E[U]. O custo é convexo em R, então basta avançar até ele subir."""
+    melhor, R = None, R0
+    while True:
+        a = avaliar(Q, R, ps)
+        custo = R + k * a['E_descobertos_dia']
+        if melhor is not None and custo > melhor['custo_dia']:
+            return melhor
+        melhor = {'R': R, 'custo_dia': custo, **a}
+        R += 1
+
+
+def quadro_extra_pct(Q, R, a_planejada):
+    """Folha por posição - 1, em %: Q + R escalados por dia, mais a cobertura planejada (férias e
+    afastamentos prolongados), que é a fração a_planejada da folha."""
+    return ((Q + R) / (1 - a_planejada) / Q - 1) * 100
+
+# ---------------------------------------------------------------- funções: efeito_escala_rotatividade
+def efeito_escala_rotatividade(DADOS="dados"):
+    """Trilha 3: associação entre a escala praticada (6x1 x 5x2) e a taxa de desligamento.
+
+    Poisson para a taxa mensal de saída por vínculo (offset: log dos meses de exposição; erros robustos),
+    com a escala medida no ponto e controles para empresa, grupo de função e tempo de casa < 1 ano.
+
+    Uso: python src/efeito_escala_rotatividade.py dados
+    """
+    CORTE = pd.Timestamp("2026-09-30")
+    rd = lambda n, **k: pd.read_csv(f"{DADOS}/{n}.csv", sep=";", encoding="utf-8-sig", **k)
+
+    b = rd("fBatidas", usecols=["ID_INTEGRANTE", "CODCOLIGADA", "DATA", "SITUACAO_NA_DATA", "MINUTOS_PREVISTOS", "FERIADO"], parse_dates=["DATA"])
+    i = rd("dim_integrante", usecols=["ID_INTEGRANTE", "ID_FUNCAO", "DATAADMISSAO", "DATADEMISSAO", "CATEGORIA_DESLIGAMENTO"], parse_dates=["DATAADMISSAO", "DATADEMISSAO"])
+    f = rd("dim_funcao", usecols=["ID_FUNCAO", "FUNCAO"])
+
+    x = b.merge(i, on="ID_INTEGRANTE").merge(f, on="ID_FUNCAO")
+    x = x[(x.DATA >= x.DATAADMISSAO) & (x.DATADEMISSAO.isna() | (x.DATA <= x.DATADEMISSAO))]   # só dias do contrato
+    x = x[~x.FUNCAO.str.contains("APRENDIZ", na=False)]
+
+    # escala praticada: dias com jornada prevista por semana, nos dias normais (ativo, sem feriado)
+    n = x[(x.SITUACAO_NA_DATA == "A") & (x.FERIADO == 0)]
+    g = n.groupby("ID_INTEGRANTE").agg(dias=("DATA", "size"), trab=("MINUTOS_PREVISTOS", lambda s: (s > 0).sum()))
+    g = g[g.dias >= 28]
+    g["dsem"] = 7 * g.trab / g.dias
+    g["escala"] = np.select([g.dsem >= 5.5, (g.dsem >= 4.5) & (g.dsem < 5.5)], ["6x1", "5x2"], "outra")
+
+    e = x.groupby("ID_INTEGRANTE").agg(ini=("DATA", "min"), fim=("DATA", "max"), emp=("CODCOLIGADA", "first"), fun=("FUNCAO", "first"),
+                                         dem=("DATADEMISSAO", "first"), cat=("CATEGORIA_DESLIGAMENTO", "first"), adm=("DATAADMISSAO", "first"))
+    d = g.join(e, how="inner")
+    d = d[d.escala != "outra"].copy()
+    d["expo"] = ((d.fim - d.ini).dt.days + 1) / 30.44
+    d["saiu"] = (d.dem.notna() & (d.dem <= CORTE)).astype(int)
+    d["vol"] = ((d.saiu == 1) & (d.cat == "VOLUNTARIO")).astype(int)
+    d["grupo"] = np.where(d.fun.str.contains("MOTORISTA", na=False) & ~d.fun.str.contains("ONIBUS", na=False), "mot_caminhao", "demais")
+    d["novato"] = ((d.ini - d.adm).dt.days < 365).astype(int)
+    d = d[d.expo > 0]
+
+    print("vínculos:", len(d))
+    print(d.groupby("escala").agg(n=("saiu", "size"), saidas=("saiu", "sum"), voluntarias=("vol", "sum"), meses=("expo", "sum")).round(1))
+    for alvo in ("saiu", "vol"):
+        for nome, sub in (("todas as empresas", d), ("só empresa 6", d[d.emp == 6])):
+            X = sm.add_constant(pd.get_dummies(sub[["escala", "grupo", "emp", "novato"]].astype(str), drop_first=True).astype(float))
+            m = sm.GLM(sub[alvo], X, family=sm.families.Poisson(), offset=np.log(sub.expo)).fit(cov_type="HC0")
+            k = [c for c in X.columns if c.startswith("escala")][0]
+            lo, hi = np.exp(m.conf_int().loc[k])
+            print(f"{alvo:5s} | {nome:18s} | RR 6x1/5x2 = {np.exp(m.params[k]):.2f}  IC95% [{lo:.2f}, {hi:.2f}]  p = {m.pvalues[k]:.3f}  n = {len(sub)}")
+
+
+# ====================================================================================================
+# AUDITORIA DOS DADOS (números da Seção 2 do relatório)
+# ====================================================================================================
+# ---------------------------------------------------------------- auditoria dos dados (números citados na Seção 2 do relatório)
+def auditoria(DADOS='dados'):
+    """Verificações de qualidade que orientaram a modelagem (Seção 2 do relatório)."""
+    rd = lambda n, **k: pd.read_csv(f'{DADOS}/{n}.csv', sep=';', encoding='utf-8-sig', **k)
+    i = rd('dim_integrante', parse_dates=['DATAADMISSAO', 'DATADEMISSAO'])
+    b = rd('fBatidas', parse_dates=['DATA'])
+    a = rd('fAfastamentos', parse_dates=['DT_INICIO', 'DT_FIM'])
+    h = rd('dim_horario', usecols=['ID_HORARIO', 'ESCALA'])
+    ini, fim = pd.Timestamp('2025-01-01'), pd.Timestamp('2026-09-30')
+    out = {'vínculos': len(i), 'pessoas (CODPESSOA)': i.CODPESSOA.nunique(), 'linhas de ponto': len(b), 'afastamentos': len(a),
+           'vínculos com ponto': b.ID_INTEGRANTE.nunique()}
+    # cobertura do ponto entre os vínculos do período, por empresa
+    per = i[(i.DATAADMISSAO <= fim) & (i.DATADEMISSAO.isna() | (i.DATADEMISSAO >= ini))].copy()
+    per['tem_ponto'] = per.ID_INTEGRANTE.isin(set(b.ID_INTEGRANTE))
+    cob = (per.groupby('CODCOLIGADA').tem_ponto.mean() * 100).round(0)
+    # dependência entre ter ponto e empresa x escala (qui-quadrado e V de Cramér)
+    per = per.merge(h, on='ID_HORARIO', how='left')
+    tab = pd.crosstab(per.CODCOLIGADA.astype(str) + '|' + per.ESCALA.astype(str), per.tem_ponto).values
+    esp = tab.sum(1, keepdims=True) * tab.sum(0, keepdims=True) / tab.sum()
+    qui2 = ((tab - esp) ** 2 / esp).sum()
+    out['V de Cramér (ponto x empresa e escala)'] = round(np.sqrt(qui2 / tab.sum() / (min(tab.shape) - 1)), 2)
+    # linhas de ponto fora do contrato
+    x = b.merge(i[['ID_INTEGRANTE', 'DATAADMISSAO', 'DATADEMISSAO']], on='ID_INTEGRANTE', how='inner')
+    out['linhas antes da admissão'] = int((x.DATA < x.DATAADMISSAO).sum())
+    out['linhas depois da demissão'] = int((x.DATADEMISSAO.notna() & (x.DATA > x.DATADEMISSAO)).sum())
+    # afastamentos duplicados e minutos impossíveis
+    out['afastamentos duplicados'] = int(a.duplicated().sum())
+    out['linhas com minutos impossíveis'] = int(((b.MINUTOS_TRABALHADOS < 0) | (b.MINUTOS_TRABALHADOS > 1440)).sum())
+    # escala do cadastro x horário usado no dia
+    y = b.merge(i[['ID_INTEGRANTE', 'ID_HORARIO']].rename(columns={'ID_HORARIO': 'H_CAD'}), on='ID_INTEGRANTE', how='inner')
+    out['% das linhas de ponto com horário diferente do cadastro'] = round((y.ID_HORARIO != y.H_CAD).mean() * 100, 1)
+    # duas fontes de férias: ponto (situação F) x afastamentos (FERIAS), dia a dia, nos vínculos com ponto
+    f = a[a.CATEGORIA_EVENTO == 'FERIAS'].dropna(subset=['DT_FIM'])
+    dias = pd.concat([pd.DataFrame({'ID_INTEGRANTE': r.ID_INTEGRANTE, 'DATA': pd.date_range(r.DT_INICIO, r.DT_FIM)}) for r in f.itertuples()])
+    dias = dias.drop_duplicates().assign(af=1)
+    z = b[['ID_INTEGRANTE', 'DATA', 'SITUACAO_NA_DATA']].merge(dias, on=['ID_INTEGRANTE', 'DATA'], how='left')
+    p1, p2 = (z.SITUACAO_NA_DATA == 'F'), z.af.fillna(0).astype(bool)
+    po = (p1 == p2).mean(); pe = p1.mean() * p2.mean() + (1 - p1.mean()) * (1 - p2.mean())
+    out['kappa de Cohen (férias: ponto x afastamentos)'] = round((po - pe) / (1 - pe), 2)
+    out['dias de férias em só uma das fontes'] = int((p1 != p2).sum())
+    # primeiro registro de ponto dos admitidos no período: cai no dia 21 (o ponto segue o ciclo da folha)
+    adm = i[(i.DATAADMISSAO >= ini) & (i.DATAADMISSAO <= fim)][['ID_INTEGRANTE']]
+    prim = b.groupby('ID_INTEGRANTE').DATA.min().rename('prim').reset_index().merge(adm, on='ID_INTEGRANTE')
+    out['% dos admitidos no período com 1º registro no dia 21'] = round((prim.prim.dt.day == 21).mean() * 100, 1)
+    # dias de férias no ponto em sequências de mais de 30 dias (não são férias pela CLT)
+    fz = b[b.SITUACAO_NA_DATA == 'F'][['ID_INTEGRANTE', 'DATA']].sort_values(['ID_INTEGRANTE', 'DATA'])
+    nova = (fz.ID_INTEGRANTE != fz.ID_INTEGRANTE.shift()) | (fz.DATA.diff().dt.days != 1)
+    fz['seq'] = nova.cumsum()
+    tam = fz.groupby('seq').agg(n=('DATA', 'size'), vinc=('ID_INTEGRANTE', 'first'))
+    longas = tam[tam.n > 30]
+    out['% dos dias de férias do ponto em sequências > 30 dias'] = round(longas.n.sum() / len(fz) * 100, 1)
+    out['vínculos com sequência de férias > 30 dias'] = longas.vinc.nunique()
+    out['maior sequência de férias (dias)'] = int(tam.n.max())
+    print(pd.Series(out).to_string()); print('\ncobertura do ponto (% dos vínculos do período), por empresa:'); print(cob.to_string())
+    return out, cob
+print("\n" + "=" * 80 + "\nAUDITORIA DOS DADOS\n" + "=" * 80)
+auditoria("dados")
+
 
 # ====================================================================================================
 # PARTE B. TRILHA 1 — ROTATIVIDADE
@@ -484,10 +747,12 @@ print(integrantes.shape, serie.shape, end="\n\n")
 #   meses. Isso permite testar projeções contra o que realmente aconteceu.
 # - **Outubro de 2026 fica de fora:** só há demissões de 01 a 13/10 e nenhuma admissão registrada, e isso
 #   distorceria o mês.
-# - **Taxa anual equivalente:** o turnover de uma janela de N meses é calculado pela fórmula acima com o
-#   headcount médio da janela, e anualizado por 12/N.
-# turnover por ano-calendario (formula do enunciado) e headcount medio; 2026 = 9 meses anualizados
-# obs.: 2026 tem 9 meses e e anualizado; na empresa 1 (encerrada em 2026) o valor perde o sentido
+# - **Turnover mensal anualizado:** o turnover de uma janela de N meses é calculado pela fórmula acima com
+#   o headcount médio da janela, e anualizado por 12/N. **Não é** a fórmula aplicada a um ano inteiro (cujo
+#   headcount inclui todos os vínculos do ano e dá valores menores); as duas definições são comparadas na
+#   seção 1.
+# turnover mensal anualizado por ano-calendario (taxa mensal com o headcount de cada mes x 12; 2026 = 9 meses)
+# obs.: e a definicao usada na projecao; a formula do enunciado aplicada ao ano inteiro esta na celula seguinte
 linhas = []
 for e, d in S.items():
     for ano, g in d.groupby(d.mes.dt.year):
@@ -495,6 +760,26 @@ for e, d in S.items():
         linhas.append({'empresa': e, 'ano': ano + 0, 'turnover_anual_%': t, 'hc_medio': g.hc.mean()})
 anual = pd.DataFrame(linhas)
 print(anual.pivot(index='ano', columns='empresa', values='turnover_anual_%').round(1), end="\n\n")
+
+# **Duas definições, dois números.** A fórmula do enunciado depende do período: aplicada a **um mês** e
+# multiplicada por 12 (*turnover mensal anualizado*, a definição usada na projeção), o headcount é o do mês;
+# aplicada a **um ano inteiro**, o headcount passa a ser todos os vínculos que existiram no ano, inclusive
+# quem entrou e saiu, e o valor fica menor. Nas empresas com muita entrada e saída (6 e 8) a diferença é
+# grande. A tabela abaixo mostra as duas lado a lado, mais a fórmula aplicada a uma janela de 36 meses, que
+# é o horizonte do contrato.
+# a mesma formula do enunciado em periodos diferentes
+defs = []
+for e in (3, 4, 5, 6, 7, 8):
+    defs.append({'empresa': e,
+                 'mensal anualizado, 36m (projeção) %': taxa_anual(S[e][S[e].mes <= pd.Timestamp('2026-09-01')], 36),
+                 'fórmula no ano 2024 %': turnover_periodo(integrantes, e, '2024-01-01', '2024-12-31'),
+                 'fórmula no ano 2025 %': turnover_periodo(integrantes, e, '2025-01-01', '2025-12-31'),
+                 'fórmula jan-set/2026 (sem anualizar) %': turnover_periodo(integrantes, e, '2026-01-01', CORTE),
+                 'fórmula na janela de 36m %': turnover_periodo(integrantes, e, '2023-10-01', CORTE)})
+defs = pd.DataFrame(defs).set_index('empresa')
+import os; os.makedirs('resultados', exist_ok=True)
+defs.round(2).to_csv('resultados/trilha1_turnover_definicoes.csv', encoding='utf-8-sig')
+print(defs.round(1), end="\n\n")
 print(anual.pivot(index='ano', columns='empresa', values='hc_medio').round(0), end="\n\n")
 if TEM_MPL:   # gráfico salvo em figuras/t1_01.png
     # turnover movel de 12 meses por empresa
@@ -782,10 +1067,10 @@ for e in (3, 5, 6, 7, 8):
 print(pd.DataFrame(linhas).set_index('empresa').round(1), end="\n\n")
 
 # O modelo de coortes (só referência) aponta, para a empresa 6, uma rotatividade no ano 1 **acima** da média
-# de 36 meses (71–72% contra 61%): o quadro de set/2026 tem muita gente com pouco tempo de casa
-# (contratações de 2026), e esse grupo tem risco alto de saída. Na empresa 8 o modelo também fica acima
-# (31–33% contra 28,5%) e, na 5, abaixo ou igual. É um argumento para olhar a **parte alta da faixa** nas
-# empresas 6 e 8.
+# de 36 meses (70–71% contra 61%): o quadro de set/2026 tem muita gente com pouco tempo de casa
+# (contratações de 2026), e esse grupo tem risco alto de saída. Na empresa 8 o modelo fica praticamente
+# igual à média (28% contra 28,5%) e, na 5, abaixo. É um argumento para olhar a **parte alta da faixa** na
+# empresa 6.
 if TEM_MPL:   # gráfico salvo em figuras/t1_03.png
     ok = proj.dropna(subset=['turnover_base_%'])
     fig, ax = plt.subplots(figsize=(9, 4))
@@ -948,9 +1233,9 @@ print(tc.round(2), end="\n\n")
 
 # O **tempo de casa muda tudo**, e é o que liga esta trilha à Trilha 1:
 #
-# - **Férias:** praticamente zero abaixo de 1 ano de casa e de 8,0% a 8,4% depois, coerente com os 30 dias
-#   por ano da lei (30/365 = 8,2%). Por isso a taxa de férias de uma empresa depende da parcela do quadro
-#   que já tem direito.
+# - **Férias:** praticamente zero abaixo de 1 ano de casa e de 8,0% a 8,4% depois, próximo dos 30 dias por
+#   ano da lei (30/365 = 8,2%), mas veja a ressalva logo abaixo: parte desses dias não é férias. Por isso a
+#   taxa de férias de uma empresa depende da parcela do quadro que já tem direito.
 # - **Ausência curta:** 5,1% nos primeiros 6 meses contra 2,4% a 2,5% com mais de 2 anos. Só as faltas vão
 #   de 3,1% para 0,5%.
 # - **Afastamento prolongado:** cresce com o tempo de casa (0,6% abaixo de 6 meses, ~6,4% acima de 2
@@ -958,6 +1243,27 @@ print(tc.round(2), end="\n\n")
 #
 # Consequência: empresas com rotatividade alta têm **menos férias** (muita gente ainda sem direito) e **mais
 # faltas** (muita gente nova).
+# ressalva: sequencias de ferias no ponto mais longas que o limite legal (30 dias por periodo aquisitivo)
+fb = pd.read_csv('dados/fBatidas.csv', sep=';', encoding='utf-8-sig',
+                 usecols=['ID_INTEGRANTE', 'CODCOLIGADA', 'DATA', 'SITUACAO_NA_DATA'], parse_dates=['DATA'])
+fe = fb[fb.SITUACAO_NA_DATA == 'F'].sort_values(['ID_INTEGRANTE', 'DATA'])
+bloco = (fe.groupby('ID_INTEGRANTE').DATA.diff().dt.days != 1).cumsum()
+dur = fe.groupby(bloco).DATA.transform('size')
+seq = pd.DataFrame({'dias F no ponto': fe.groupby('CODCOLIGADA').size(),
+                    'em sequências > 30 dias': fe[dur > 30].groupby('CODCOLIGADA').size(),
+                    'em sequências > 60 dias': fe[dur > 60].groupby('CODCOLIGADA').size()}).fillna(0).astype(int)
+seq.loc['total'] = seq.sum()
+seq['% em > 30 dias'] = (100 * seq['em sequências > 30 dias'] / seq['dias F no ponto']).round(1)
+print(f'{fe.ID_INTEGRANTE[dur > 30].nunique()} vínculos com "férias" contínuas de mais de 30 dias; maior sequência: {dur.max()} dias')
+print(seq, end="\n\n")
+
+# **Ressalva sobre a validação das férias.** Parte dos dias marcados como férias (`F`) no ponto está em
+# sequências contínuas de mais de 30 dias, e uma parte em sequências de mais de 60, o que não é compatível
+# com férias pela CLT (provavelmente são afastamentos longos registrados como férias). Por isso a
+# coincidência da taxa entre elegíveis com 30/365 = 8,2% **não deve ser lida como validação**: a taxa de
+# férias propriamente dita é provavelmente menor e a de afastamento prolongado, maior. **O quadro extra
+# total quase não muda**, porque esses dias continuam sendo ausência que precisa de cobertura; muda só a
+# divisão entre os blocos.
 # validacao do mecanismo de ferias: empresa 6, motoristas. Prever ferias de jan-set/2026 com a taxa de 2025
 # (so quem tem >=1 ano) x parcela elegivel de 2026, contra a taxa media de 2025 sem ajuste
 m = ponto[(ponto.empresa == 6) & (ponto.grupo == 'Motorista (caminhão e leves)')].copy()
@@ -1061,6 +1367,7 @@ dia = dia[dia.e > dia.e.median() * .5]                     # dias com jornada re
 p_med, n_med = dia.p.mean(), dia.n.mean()
 var_obs, var_bin = dia.p.var(), p_med * (1 - p_med) / n_med
 SIGMA2 = max(0, var_obs - var_bin)
+dia[['p', 'n']].to_csv('resultados/trilha2_ausencia_curta_diaria.csv', encoding='utf-8-sig')   # insumo do notebook 06
 print(pd.Series({'dias analisados': len(dia), 'ausência curta média diária': p_med, 'P95 empírico': dia.p.quantile(.95), 'P99 empírico': dia.p.quantile(.99),
            'variância observada': var_obs, 'variância se fossem independentes (binomial)': var_bin, 'choque comum (desvio)': SIGMA2 ** .5}).round(4).to_frame('valor'), end="\n\n")
 if TEM_MPL:   # gráfico salvo em figuras/t2_02.png
@@ -1189,10 +1496,10 @@ print(hc, end="\n\n")
 # | Empresa | Posições | Ano 1 | Ano 3 | Faixa baixo–alto (ano 3) | Confiança |
 # |---|---|---|---|---|---|
 # | 5 | 2.824 | 21,6% | 21,7% | 19,3% a 24,0% | **baixa** (nenhum dado próprio) |
-# | 8 | 978 | 19,7% | 19,4% | 17,3% a 21,5% | média-baixa (76% do quadro sem dados) |
-# | 6 | 760 | 17,9% | 18,6% | 16,2% a 21,3% | alta |
+# | 8 | 978 | 20,1% | 19,8% | 17,6% a 21,9% | média-baixa (76% do quadro sem dados) |
+# | 6 | 760 | 18,0% | 18,7% | 16,2% a 21,4% | alta |
 # | 3 | 113 | 14,8% | 16,6% | 14,6% a 18,6% | média |
-# | 7 | 45 | 32,2% | 33,7% | 25,2% a 43,6% | baixa (amostra de 46 pessoas) |
+# | 7 | 45 | 32,6% | 33,8% | 25,3% a 43,8% | baixa (amostra de 46 pessoas) |
 # | 4 | 7 | 27,1% | 32,7% | 30,9% a 34,6% | muito baixa (7 pessoas) |
 #
 # Em número de integrantes (tabela seguinte), o cenário base soma **~970 integrantes extras no ano 1** e
@@ -1223,6 +1530,7 @@ for k in ('ferias', 'prolongada', 'curta_media', 'reserva'):
     w[k] = w[k] / 3 / w.ativos * 100
 w['perda_total_%'] = w[['ferias', 'prolongada', 'curta_media', 'reserva']].sum(axis=1)
 w['extra_%_base'] = w['perda_total_%'] / (100 - w['perda_total_%']) * 100
+w.round(4).to_csv('resultados/trilha2_decomposicao_por_empresa.csv', encoding='utf-8-sig')   # insumo do notebook 06
 print(w.round(1), end="\n\n")
 
 # **Decomposição (média dos 3 anos, em % das posições).** Na empresa 5, a perda de 17,8% se divide em férias
@@ -1650,9 +1958,9 @@ print(tabA.round(1), end="\n\n")
 # | Empresa | Cobertura (T2) | Escala (T3) | Vagas (T1) | **Total** |
 # |---|---|---|---|---|
 # | 5 | 21,6 | 0,0 | 1,0 | **122,7** |
-# | 8 | 19,5 | 1,7 | 2,8 | **124,0** |
-# | 6 | 18,4 | 19,4 | 6,9 | **144,7** |
-# | 7 | 33,1 | 17,5 | 1,7 | 152,3 |
+# | 8 | 19,9 | 1,7 | 2,8 | **124,4** |
+# | 6 | 18,4 | 19,4 | 6,9 | **144,8** |
+# | 7 | 33,4 | 17,5 | 1,7 | 152,6 |
 # | 3 | 16,0 | 0,0 | 3,1 | 119,2 |
 # | 4 | 30,5 | 3,7 | 3,0 | 137,2 |
 #
@@ -1677,7 +1985,7 @@ atual['folha atual'] = F.loc[emps]
 atual.loc['total'] = atual.sum()
 print(atual.round(0), end="\n\n")
 
-# Aplicando o modelo à operação atual, a folha de 4.727 pessoas se decompõe em **3.918 posições + 809 de
+# Aplicando o modelo à operação atual, a folha de 4.727 pessoas se decompõe em **3.916 posições + 811 de
 # cobertura de ausências**. Com a mudança de escala (população A, jornada diária mantida) e as vagas por
 # rotatividade, a folha necessária passa a **4.967: +145 pela escala e +95 pelas vagas, ou seja, +240
 # (+5,1%)**.
@@ -1693,11 +2001,11 @@ rec.loc['total'] = rec.sum()
 print(rec.round(0), end="\n\n")
 
 # **Reconciliação com os notebooks anteriores.** A Trilha 3 não muda: 145 integrantes. A Trilha 2 muda de
-# **977 para 809** em número de pessoas. O que mudou foi só a **base** de contagem, e não o método:
+# **975 para 811** em número de pessoas. O que mudou foi só a **base** de contagem, e não o método:
 #
 # - No notebook 03, o extra por posição (`e`) foi multiplicado pelo quadro ativo, tratando-o como
-#   *posições*: 977.
-# - Aqui, o quadro ativo é tratado como a *folha*, que já contém a cobertura: `F × a` = 809.
+#   *posições*: 975.
+# - Aqui, o quadro ativo é tratado como a *folha*, que já contém a cobertura: `F × a` = 811.
 #
 # O percentual por posição da Trilha 2 (por exemplo, 21,6% na empresa 5) continua válido e é a medida que se
 # aplica a uma licitação. A leitura adotada neste modelo é a que combina com a Trilha 3, e por isso passa a
@@ -1780,12 +2088,12 @@ sem.loc['total'] = sem.sum()
 print(sem.round(2), end="\n\n")
 
 # Custo anual da operação atual por componente, usando o salário médio de referência de cada empresa. **Só
-# salário** (sem encargos), em R$ milhões por ano: total de **R$ 151,1 milhões**, dos quais posições 120,2,
+# salário** (sem encargos), em R$ milhões por ano: total de **R$ 151,1 milhões**, dos quais posições 120,1,
 # cobertura de ausências 25,0, mudança de escala 3,4 e vagas 2,6. A empresa 5 responde por R$ 98,6 milhões
 # (65%), e é a de dados menos confiáveis.
 #
 # Com o multiplicador de encargos de 1,7 (premissa da equipe), o total é de **R$ 256,8 milhões por ano**:
-# posições 204,3, cobertura 42,5, escala 5,7 e vagas 4,4.
+# posições 204,2, cobertura 42,6, escala 5,7 e vagas 4,4.
 com = cus[cus.custo != 'só salário'].set_index('empresa').drop(columns='custo'); com.loc['total'] = com.sum()
 print(f'Com encargos (×{ENCARGOS}, premissa), R$ milhões por ano'); print(com.round(2), end="\n\n")
 # contrato de 3 anos (valores constantes), custo adicional frente a "so posicoes", e quanto cada trilha pesa
@@ -1793,14 +2101,32 @@ tot = com.loc['total']
 resumo = pd.DataFrame({'R$ milhões/ano': tot, 'R$ milhões em 3 anos': tot * 3, '% do custo das posições': tot / tot['posições'] * 100}).round(1)
 print(resumo, end="\n\n")
 
+# **Atenção à leitura.** O "custo acima das posições" **não é** o aumento de custo em relação à operação de
+# hoje: a cobertura de ausências (T2) já existe e já é paga na folha atual (são os ~811 integrantes que
+# cobrem férias e afastamentos dentro dos 4.727). O que é **novo** em relação à folha atual é só a mudança
+# de escala (T3) e as vagas por rotatividade (T1):
+# acrescimo sobre a folha atual: a cobertura (T2) ja esta dentro da folha de hoje
+novos = ['escala (T3)', 'vagas (T1)']
+acr = pd.DataFrame({'pessoas': atual.loc[list(emps), novos].sum(),
+                    'R$ mi/ano (só salário)': sem.loc['total', novos],
+                    f'R$ mi/ano (encargos ×{ENCARGOS})': com.loc['total', novos]})
+acr.loc['total'] = acr.sum()
+acr[f'R$ mi em 3 anos (encargos ×{ENCARGOS})'] = acr[f'R$ mi/ano (encargos ×{ENCARGOS})'] * 3
+acr[f'% da folha atual (encargos ×{ENCARGOS})'] = acr[f'R$ mi/ano (encargos ×{ENCARGOS})'] / (com.loc['total', ['posições', 'cobertura (T2)']].sum()) * 100
+acr.round(2).to_csv('resultados/integrado_acrescimo_folha_atual.csv', encoding='utf-8-sig')
+print(acr.round(1), end="\n\n")
+
 # Em um contrato de 3 anos a valores constantes (sem reajuste, sem inflação e sem crescimento de quadro),
 # com encargos de 1,7:
 #
-# - A **cobertura de ausências** custa **R$ 127 milhões** (20,8% do custo das posições). É o componente
+# - A **cobertura de ausências** custa **R$ 128 milhões** (20,8% do custo das posições). É o componente
 #   que mais pesa.
 # - A **mudança de escala** (população A, jornada diária mantida) custa **R$ 17 milhões** (2,8%).
 # - As **vagas por rotatividade** custam **R$ 13 milhões** (2,1%).
-# - Os três juntos somam cerca de **R$ 158 milhões** acima do custo das posições, ou 25,7%.
+# - Os três juntos somam cerca de **R$ 158 milhões** acima do custo das posições, ou 25,8%. **Isso não é o
+#   aumento sobre a folha atual:** a cobertura já existe e já é paga hoje. O acréscimo real sobre a folha
+#   atual é só escala + vagas: **+240 pessoas, cerca de R$ 10 milhões por ano ou R$ 30 milhões em 3 anos**
+#   (4,1% da folha atual, com encargos de 1,7).
 #
 # A mudança de escala é pequena **na população A** (porque só 736 pessoas estão em 6x1 no cadastro). Na
 # população B ela cresce bastante, e é o maior risco do resultado.
@@ -1856,3 +2182,145 @@ pd.concat({'por_100_posicoes_A': tabA, 'por_100_posicoes_B': tabB}, names=['popu
 atual.round(2).to_csv('resultados/integrado_operacao_atual_pessoas.csv', encoding='utf-8-sig')
 cus.round(3).to_csv('resultados/integrado_custos.csv', index=False, encoding='utf-8-sig')
 print(torn.round(3).to_csv('resultados/integrado_sensibilidade.csv', encoding='utf-8-sig'), end="\n\n")
+
+
+# ====================================================================================================
+# PARTE F. EXTENSÕES: FAIXAS VALIDADAS, BAYES EMPÍRICO, RESERVA POR CUSTO E ESCALA x ROTATIVIDADE
+# ====================================================================================================
+print("\n" + "=" * 80 + "\nPARTE F. EXTENSÕES: FAIXAS VALIDADAS, BAYES EMPÍRICO, RESERVA POR CUSTO E ESCALA x ROTATIVIDADE\n" + "=" * 80)
+
+# # 06 · Extensões: faixas calibradas (T1), reserva por custo (T2), incerteza sem dados (T2) e escala ×
+# rotatividade (T3)
+#
+# Quatro melhorias sobre os notebooks 02 a 05, cada uma validada e com resultado salvo em `resultados/`:
+#
+# 1. **T1:** encolhimento bayesiano empírico entre empresas e **faixas calibradas fora da amostra** (a
+#    faixa do notebook 02 era calibrada com todas as origens, inclusive as futuras).
+# 2. **T2:** a reserva para ausência curta passa a ser escolhida pelo **menor custo esperado**,
+#    considerando que a própria reserva também falta, em vez de uma regra fixa de 95%.
+# 3. **T2:** o erro de extrapolação medido (RMSE de 5,4 p.p.) é **propagado** para as células sem dado
+#    próprio (empresa 5 e ônibus da empresa 8).
+# 4. **T3:** estimativa da **associação entre a escala praticada e a taxa de desligamento** (modelo de
+#    Poisson com exposição).
+import warnings; warnings.filterwarnings('ignore')
+pd.set_option('display.width', 220); pd.set_option('display.max_columns', 40)
+integrantes = carregar_integrantes('dados/dim_integrante.csv')
+serie = serie_mensal(integrantes)
+S = {e: d.sort_values('mes').reset_index(drop=True) for e, d in serie.groupby('empresa')}
+proj = pd.read_csv('resultados/trilha1_projecao.csv', encoding='utf-8-sig').set_index('empresa')
+
+# ## 1. T1 · Encolhimento entre empresas: o ponto central muda?
+linhas = []
+for H in (12, 24, 36):
+    bt = backtest_eb(S, H)
+    linhas.append({'H (meses)': H, 'origens': len(bt), 'MAE média 36m': (bt.media36 - bt.real).abs().mean(),
+                   'MAE encolhida': (bt.eb36 - bt.real).abs().mean(),
+                   'MAE emp. 3 (média)': (bt[bt.empresa == 3].media36 - bt[bt.empresa == 3].real).abs().mean(),
+                   'MAE emp. 3 (encolhida)': (bt[bt.empresa == 3].eb36 - bt[bt.empresa == 3].real).abs().mean()})
+print(pd.DataFrame(linhas).set_index('H (meses)').round(2), end="\n\n")
+
+# O encolhimento empata com a média de 36 meses no conjunto e só ajuda a empresa 3 (a única pequena com
+# histórico no backtest). **O ponto central do notebook 02 se mantém**; o encolhimento confirma que a
+# escolha não é frágil.
+
+# ## 2. T1 · As faixas cobrem o que dizem cobrir?
+cob = []
+for H in (12, 24):
+    bt = backtest_eb(S, H)
+    antiga = cobertura_faixa(bt)                       # P10-P90 por empresa, calibrada como no notebook 02
+    nova = cobertura_lognormal(bt, z=1.2816)           # log-normal encolhida, só com o passado
+    cob.append({'H (meses)': H, 'nominal': '80%', 'antiga, dentro da amostra': antiga.dentro.mean() * 100,
+                'antiga, fora da amostra': antiga.fora.mean() * 100, 'nova, fora da amostra': nova.fora.mean() * 100})
+print(pd.DataFrame(cob).set_index('H (meses)').round(0), end="\n\n")
+
+# A faixa do notebook 02 parece cobrir 80% porque foi calibrada com as mesmas origens que avalia. **Sem
+# olhar o futuro, cobre só 54% (12 meses) e 37% (24 meses).** A faixa nova (razão realizado/projetado em
+# escala log, com centro e dispersão de cada empresa encolhidos para os do grupo) chega a 83% e ~70%. Com 36
+# meses há poucas origens independentes e a calibração não é confiável (na empresa 6, a quebra de regime de
+# 2020–2023 produz razões de até 5×), por isso usamos a faixa **anual**, limitada pelo maior turnover de 12
+# meses já observado.
+def teto(e):
+    d = S[e]; t = ((d.adm + d.resc).rolling(12).sum() / 2) / d.hc.rolling(12).mean() * 100
+    return t[d.hc.rolling(12).mean() >= 20].max()
+
+bt12 = backtest_eb(S, 12); bt12['razao'] = bt12.real / bt12.media36
+eb, _, _ = taxas_eb(S, pd.Timestamp('2026-09-01'))
+fx = []
+for e in (5, 8, 6, 3, 7, 4):
+    lo, c, hi = faixa_lognormal(bt12[bt12.empresa == e].razao, bt12.razao, z=1.2816)
+    base = proj.loc[e, 'turnover_base_%']; T = teto(e) if e != 4 else max(teto(3), teto(7))
+    fx.append({'empresa': e, 'base (média 36m)': base, 'encolhida': eb.get(e, np.nan), 'faixa nova: P10': base * lo,
+               'faixa nova: P90 (limitada ao teto)': min(base * hi, max(T, base)), 'teto histórico 12m': T,
+               'faixa antiga': f"{proj.loc[e, 'contrato_baixo_%']:.1f} a {proj.loc[e, 'contrato_alto_%']:.1f}"})
+fx = pd.DataFrame(fx).set_index('empresa')
+fx.round(2).to_csv('resultados/trilha1_faixa_calibrada.csv', encoding='utf-8-sig')
+print(fx.round(1), end="\n\n")
+
+# O limite de cima quase não muda (já era o teto histórico). **O de baixo desce abaixo da base**: a regra "a
+# base é o piso" do notebook 02 vinha da calibração dentro da amostra e não se sustenta fora dela. Para
+# precificar, a leitura prudente continua sendo a parte alta da faixa, mas a faixa honesta é mais larga.
+
+# ## 3. T2 · Reserva para ausência curta escolhida por custo
+#
+# Num dia com taxa de ausência curta p, escalam-se Q titulares + R reservas, e cada um falta com
+# probabilidade p (a reserva também falta). Presentes: S ~ Binomial(Q + R, 1 − p); postos descobertos: U =
+# max(0, Q − S). A distribuição de p é a **empírica** dos 551 dias observados (que já contém o choque
+# comum), reescalada para a média de cada empresa. O custo diário, em pessoa-dia, é **R + k·E[U]**, em que k
+# é o custo de um posto descoberto: ~1,5 se for coberto com hora extra (50%), ~3 se houver custo operacional
+# adicional, ~10 se gerar multa contratual ou viagem não realizada.
+dia = pd.read_csv('resultados/trilha2_ausencia_curta_diaria.csv', encoding='utf-8-sig')
+dec = pd.read_csv('resultados/trilha2_decomposicao_por_empresa.csv', encoding='utf-8-sig').set_index('empresa')
+p0 = dia.p.values
+res = []
+for e, r in dec.iterrows():
+    perda = r['perda_total_%'] / 100; Q = int(round(r.ativos * (1 - perda)))
+    mu = r.curta_media / 100; ps = p0 * mu / p0.mean()
+    a_plan = (r.ferias + r.prolongada) / 100
+    folha_regra = Q * (1 + r['extra_%_base'] / 100)                 # regra de 95% (notebook 03)
+    R_regra = int(round(folha_regra * (1 - a_plan) - Q))
+    av = avaliar(Q, R_regra, ps)
+    res.append({'empresa': e, 'posições Q': Q, 'k': 'regra 95%', 'reserva R': R_regra, 'R/Q %': R_regra / Q * 100,
+                'atendimento %': av['atendimento'] * 100, 'P(algum descoberto)': av['P_algum_descoberto'],
+                'quadro extra %': r['extra_%_base']})
+    for k in (1.5, 3, 10):
+        o = reserva_otima(Q, ps, k, R0=max(0, int(Q * mu * .4)))
+        res.append({'empresa': e, 'posições Q': Q, 'k': k, 'reserva R': o['R'], 'R/Q %': o['R'] / Q * 100,
+                    'atendimento %': o['atendimento'] * 100, 'P(algum descoberto)': o['P_algum_descoberto'],
+                    'quadro extra %': quadro_extra_pct(Q, o['R'], a_plan)})
+res = pd.DataFrame(res)
+res.round(3).to_csv('resultados/trilha2_reserva_por_custo.csv', index=False, encoding='utf-8-sig')
+print(res.pivot(index='empresa', columns='k', values='quadro extra %').round(1), end="\n\n")
+print(res.set_index(['empresa', 'k'])[['posições Q', 'reserva R', 'R/Q %', 'atendimento %', 'P(algum descoberto)']].round(3), end="\n\n")
+
+# **Leitura.** A regra de 95% equivale a supor que um posto descoberto custa mais de 10 pessoas-dia. Se a
+# operação cobre o descoberto com hora extra (k ≈ 1,5), a reserva ótima é bem menor e o quadro extra cai
+# alguns pontos percentuais em todas as empresas, aceitando ~1% de postos-dia cobertos por hora extra. Se o
+# contrato pune o descoberto (k ≈ 10), a reserva ótima fica próxima da regra. **O dado que decide é o custo
+# de um posto descoberto no contrato**, e por isso o mostramos como parâmetro.
+
+# ## 4. T2 · Incerteza das células sem dado próprio
+#
+# A validação do notebook 03 mediu o erro de extrapolar a perda para células sem dados: RMSE de 5,4 p.p.
+# Propagamos esse erro (±1 RMSE na perda) para as células com peso de dados zero.
+ext = []
+for e, r in dec.iterrows():
+    perda = r['perda_total_%'] / 100
+    sem_dado = {5: 1.0, 8: 746 / 978}.get(e, 0.0)           # parcela do quadro sem dado próprio (notebook 03)
+    for nome, d in (('-1 RMSE', -.054), ('base', 0), ('+1 RMSE', .054)):
+        p = perda + sem_dado * d
+        ext.append({'empresa': e, 'cenário': nome, 'quadro extra %': p / (1 - p) * 100})
+ext = pd.DataFrame(ext).pivot(index='empresa', columns='cenário', values='quadro extra %')[['-1 RMSE', 'base', '+1 RMSE']]
+ext.round(2).to_csv('resultados/trilha2_faixa_extrapolacao.csv', encoding='utf-8-sig')
+print(ext.round(1), end="\n\n")
+
+# Na empresa 5 a faixa honesta é de ~14% a ~30% das posições, bem mais larga que a faixa baixo–alto do
+# notebook 03 (19% a 24%), que só refletia a escolha da referência. **É o maior risco do preço, e só se
+# reduz com o ponto da empresa 5.**
+
+# ## 5. T3 · A escala praticada está associada à rotatividade?
+print(efeito_escala_rotatividade("dados"), end="\n\n")
+
+# Controlando empresa, grupo de função e tempo de casa, o total de saídas não difere entre 6x1 e 5x2, mas as
+# **saídas voluntárias são 1,74 vez mais frequentes no 6x1** (IC95% 1,00 a 3,04; p = 0,052). É associação,
+# não efeito causal; aponta que o 5x2 pode reduzir as saídas voluntárias (~43% a menos se o excesso
+# desaparecer), o que na empresa 6 equivale a ~20% a menos de turnover.

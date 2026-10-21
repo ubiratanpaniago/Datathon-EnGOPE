@@ -1,0 +1,328 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazilian]{babel}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{icomma}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{tabularx}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18,/pgf/number format/use comma,/pgf/number format/1000 sep={.}}
+\definecolor{azul}{HTML}{2A78D6}
+\definecolor{laranja}{HTML}{EB6834}
+\definecolor{verde}{HTML}{1BAF7A}
+\definecolor{cinza}{HTML}{52514E}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\setlist{itemsep=1pt,topsep=3pt}
+\setlength{\parskip}{3pt}
+\newcommand{\destaque}[1]{\textbf{#1}}
+
+\title{\textbf{Quanto custa manter o serviço por três anos?}\\[2pt]
+\large Rotatividade, cobertura de ausências e mudança de escala no Grupo HP}
+\author{Equipe Anovas: Augusto Duarte Farias, Ubiratan Alves Paniago Filho,\\ Gustavo Bernardo Britto e Lygia Machado Rebouças\\[2pt]
+\small III Datathon IME-UFG · VII ENGOPE · parceiro SIAN (Grupo HP)}
+\date{21 de outubro de 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent Para disputar uma licitação de três anos, o Grupo HP precisa saber quantas pessoas manter na folha para entregar o serviço todos os dias previstos. Tratamos as três trilhas como partes de um único modelo de dimensionamento, cuja unidade é a \emph{posição} (a pessoa escalada num dia). A rotatividade (T1) é projetada pela média de 36 meses, escolhida por \emph{backtest} de origem móvel entre oito estratégias, um modelo de coortes e um estimador bayesiano empírico, com faixas de incerteza validadas fora da amostra. A cobertura de ausências (T2) separa férias, afastamento prolongado e ausência curta, liga as férias ao tempo de casa da T1 e compara a reserva da regra de 95\% com a de menor custo esperado, considerando que a própria reserva também falta. A mudança de 6x1 para 5x2 (T3) é medida pela jornada efetivamente praticada no ponto, em três cenários de contrato. Resultado: a cada 100 posições, a folha precisa de 119 a 153 pessoas, conforme a empresa; para a operação atual, a folha de 4.727 pessoas vai a \destaque{4.967 (+240, +5,1\%)}, um acréscimo de cerca de \destaque{R\$ 30 milhões em três anos}. A maior incerteza não é técnica: 76\% do quadro operacional não tem ponto nem afastamentos.
+\end{abstract}
+
+\section{Motivação e leitura do problema}
+O preço de um contrato de mobilidade é, essencialmente, o custo de manter gente suficiente escalada. Três fatores fazem a folha ser maior que o número de postos: \emph{ausências} (férias, atestados, afastamentos), \emph{rotatividade} (vagas abertas enquanto alguém não é reposto) e a \emph{escala} (quantos dias cada pessoa trabalha por semana). As trilhas medem cada fator, mas a decisão de preço exige somá-los sem contar a mesma pessoa duas vezes. Por isso construímos um modelo comum (Seção~\ref{sec:integrado}) e tratamos cada trilha como um multiplicador sobre a posição.
+
+\noindent Decisões que o enunciado deixa em aberto e que adotamos:
+\begin{itemize}
+\item \textbf{Unidade:} empresa (\texttt{CODCOLIGADA}); dentro dela, grupos de função (motorista de ônibus, cobrador, motorista de caminhão e leves, demais). Aprendizes (229 ativos) ficam fora do dimensionamento.
+\item \textbf{Saída:} quadro extra em \% das posições (aplicável a qualquer licitação) e em pessoas para a operação atual (4.727 ativos operacionais em 30/09/2026).
+\item \textbf{Horizonte:} 36 meses, com taxas constantes e faixa de incerteza calibrada fora da amostra.
+\end{itemize}
+
+\noindent\fbox{\parbox{\dimexpr\linewidth-2\fboxsep-2\fboxrule}{\textbf{O que há de novo nesta solução.}
+(1) \emph{Um só modelo} para as três trilhas, com a posição como unidade, o que evita contar a mesma cobertura duas vezes;
+(2) a T1 \emph{alimenta} a T2: o risco de saída por tempo de casa projeta quem terá direito a férias;
+(3) a escala é \emph{medida no ponto} (horas realmente trabalhadas), e não lida do cadastro, o que mostra que o 5x2 atual já tem a mesma carga do 6x1;
+(4) a falta de dados é tratada como parte do problema: ponderação por credibilidade e erro de extrapolação medido e propagado;
+(5) as faixas de incerteza são \emph{validadas fora da amostra}, e a reserva é escolhida por \emph{custo esperado}, não por uma regra fixa.}}
+
+\section{Dados: o que encontramos antes de modelar}
+Os dados têm 20.001 vínculos (18.617 pessoas), 601.474 linhas de ponto e 5.052 afastamentos. Uma auditoria (reproduzida pela função \texttt{auditoria} do código) mudou o desenho da solução:
+
+\begin{itemize}
+\item \textbf{Cobertura parcial e não aleatória.} Só 1.900 vínculos têm ponto. A empresa 5 (60\% dos ativos) não tem ponto nem afastamentos; na empresa 8, nenhum motorista em \emph{revezamento} tem ponto. A falta de ponto depende da empresa e da escala (qui-quadrado de independência, V de Cramér $=0{,}93$), logo não é MCAR: taxas observadas descrevem sobretudo a empresa 6.
+\item \textbf{O ponto segue a folha, não o contrato.} Em 98\% dos vínculos admitidos no período, o primeiro registro cai no dia 21 (ciclo da folha). Há 13.064 linhas antes da admissão e 7.748 depois da demissão. Os dias após a demissão saem das taxas de ausência pela situação \emph{demitido}; no modelo de Poisson (Seção~\ref{sec:t3}) usamos só os dias do contrato.
+\item \textbf{Artefatos tratados:} início sem registro nas empresas 3 e 8 (até 20/01 e 20/03/2025, quase 100\% de falta), removido; 6 dias de abono coletivo (Carnaval, 24 e 31/12), removidos; 31 afastamentos duplicados, neutralizados ao expandir os eventos por dia. Há ainda 223 linhas com minutos impossíveis (trabalhado negativo ou acima de 24 h), 0,04\% do total.
+\item \textbf{Escala do cadastro $\neq$ escala praticada.} O cadastro guarda só o horário atual (22\% das linhas de ponto usam outro). Medimos a escala no próprio ponto.
+\item \textbf{Variáveis redundantes.} Empresa, filial e centro de custo carregam a mesma informação, assim como função e salário de referência, e a escala se confunde com a função (634 dos 736 vínculos em 6x1 são da empresa 6). Usamos uma variável por grupo, e o efeito da escala é sempre lido condicionado a empresa e função.
+\item \textbf{Duas fontes de férias.} Ponto e afastamentos concordam bem (kappa de Cohen $=0{,}85$), mas 9.742 dias aparecem em só uma delas; usamos a situação diária do ponto, que cobre todos os dias de vínculo.
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[xbar, width=0.82\linewidth, height=4.3cm, bar width=8pt, xmin=0, xmax=115,
+  symbolic y coords={Empresa 5,Empresa 8,Empresa 3,Empresa 4,Empresa 7,Empresa 6}, ytick=data,
+  xlabel={\% dos vínculos do período com registro de ponto}, nodes near coords={\pgfmathprintnumber{\pgfplotspointmeta}\%},
+  nodes near coords style={font=\footnotesize}, tick label style={font=\footnotesize}, label style={font=\footnotesize},
+  axis x line*=bottom, axis y line*=left, enlarge y limits=0.12]
+\addplot[fill=azul, draw=none] coordinates {(0,Empresa 5) (28,Empresa 8) (72,Empresa 3) (75,Empresa 4) (90,Empresa 7) (96,Empresa 6)};
+\end{axis}
+\end{tikzpicture}
+\caption{Cobertura do ponto diário. A empresa 5 (60\% dos ativos) não tem nenhum registro; na empresa 8 faltam justamente os motoristas de ônibus em revezamento. As taxas de ausência observadas descrevem sobretudo a empresa 6.}
+\end{figure}
+
+\section{Trilha 1 --- Rotatividade}\label{sec:t1}
+\textbf{Série.} Do cadastro (que cobre todo o histórico, não só 21 meses) montamos, de jan/2016 a set/2026, admissões, rescisões e headcount mensal por empresa, e o turnover pela fórmula do enunciado aplicada a cada mês. O valor projetado é o \emph{turnover mensal anualizado} (taxa mensal $\times$ 12).
+
+\textbf{Diagnóstico.} A sazonalidade é fraca e sem padrão comum. O tempo de casa importa muito: na empresa 6, quem está no 3.\textsuperscript{o} mês tem $\sim$22\% de chance de sair naquele mês, contra $\sim$1,7\% com mais de 5 anos (pico compatível com o fim do contrato de experiência de 90 dias).
+
+\textbf{Escolha por backtest.} Para cada mês de origem, usamos só o passado, projetamos 12, 24 e 36 meses e comparamos com o realizado. Testamos médias de 6 a 60 meses, médias ponderadas, uma mistura 12m+36m e um modelo de coortes por tempo de casa. As médias empatam (MAE de 6,2 a 6,9 p.p.); a \textbf{média de 36 meses} é a mais simples, a melhor no regime recente e coincide com o horizonte do contrato. O modelo de coortes não superou a média: o erro vem de eventos coletivos (perda ou ganho de contratos), não do tempo de casa. A faixa vem da razão realizado/projetado do backtest, em escala log, com centro e dispersão de cada empresa encolhidos para os do grupo e limite no maior turnover de 12 meses já observado. \textbf{Validamos a própria faixa fora da amostra}: calibrada só com o passado, ela cobre 83\% dos casos em 12 meses (nominal 80\%). A calibração usual, com todas as origens, parecia cobrir 79\%, mas, sem olhar o futuro, cobria só 54\%. Um estimador bayesiano empírico (gama-Poisson, encolhendo cada empresa para o grupo) empatou com a média de 36 meses (MAE 6,27 contra 6,33 p.p.) e só melhorou a empresa 3, o que confirma a robustez do ponto central.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrcl}
+\toprule
+Empresa & Ativos & Base (\% a.a.) & Faixa anual P10--P90 & Fórmula no ano 2025 & Confiança \\
+\midrule
+5 & 2.971 & 10,2 & 7,6 a 12,8 & 8,4 & alta \\
+8 & 1.023 & 28,5 & 21,7 a 34,5 & 21,9 & média-alta \\
+6 & 797 & 61,1 & 35,8 a 68,9 & 27,6 & baixa \\
+3 & 113 & 32,8 & 15,3 a 46,4 & 17,3 & média-baixa \\
+7 & 45 & 13,6 & 6,4 a 24,5 & 11,6 & média \\
+4 & 7 & 27,0\textsuperscript{*} & 14,2 a 46,4 & 25,0 & baixa \\
+\bottomrule
+\end{tabular}
+\caption{Turnover projetado (mensal anualizado, média de 36 meses), com faixa calibrada fora da amostra. \textsuperscript{*}Taxa agrupada das empresas pequenas. A empresa 1 não tem ativos. A coluna Ativos inclui aprendizes (nas Trilhas 2 e 3 eles ficam fora: 4.727 ativos operacionais).}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[ybar, width=0.9\linewidth, height=5cm, bar width=14pt, ymin=0, ymax=80,
+  symbolic x coords={5,8,6,3,7,4}, xtick=data, xticklabel={Empresa \tick},
+  ylabel={turnover (\% ao ano)}, legend style={font=\footnotesize, at={(0.5,-0.2)}, anchor=north, draw=none, fill=none, legend columns=2, /tikz/every even column/.append style={column sep=10pt}},
+  tick label style={font=\footnotesize}, label style={font=\footnotesize}, axis x line*=bottom, axis y line*=left, ymajorgrids, grid style={black!10}]
+\addplot[fill=azul, draw=none, area legend, error bars/.cd, y dir=both, y explicit, error bar style={black, line width=0.8pt}]
+  coordinates {(5,10.2) += (0,2.6) -= (0,2.6) (8,28.5) += (0,6.0) -= (0,6.8) (6,61.1) += (0,7.8) -= (0,25.3)
+               (3,32.8) += (0,13.6) -= (0,17.5) (7,13.6) += (0,10.9) -= (0,7.2) (4,27.0) += (0,19.4) -= (0,12.8)};
+\addplot[only marks, mark=diamond*, mark size=3.5pt, color=laranja, line legend] coordinates {(5,8.4) (8,21.9) (6,27.6) (3,17.3) (7,11.6) (4,25.0)};
+\legend{{projeção: mensal anualizado (média 36m), faixa P10--P90 validada},{fórmula aplicada ao ano de 2025}}
+\end{axis}
+\end{tikzpicture}
+\caption{Turnover projetado por empresa, com a faixa P10--P90 calibrada fora da amostra e limitada pelo teto histórico. Os losangos mostram a mesma fórmula aplicada a um ano inteiro, que dá valores menores.}
+\end{figure}
+
+\textbf{Atenção à definição.} A mesma fórmula aplicada a um ano inteiro dá valores menores, porque o headcount passa a incluir todos os que passaram pela empresa no ano (coluna \emph{Fórmula no ano 2025}). Reportamos as duas; para dimensionar vagas usamos a mensal, que mede o fluxo sobre o quadro efetivamente ocupado.
+
+\textbf{Leitura de negócio.} A empresa 5 é previsível (erro de $\sim$1,6 p.p. em 36 meses). A empresa 6 não é (erro de 26 a 28 p.p.): sua rotatividade depende de decisões comerciais, e a faixa honesta é larga (36\% a 69\%). Como o realizado superou o projetado na maioria das origens, recomendamos precificar pela parte alta da faixa nas empresas de confiança baixa.
+
+\section{Trilha 2 --- Folguistas e feristas}\label{sec:t2}
+\textbf{Ideia central.} A \emph{perda de carga} $a$ é a fração do trabalho programado que não é entregue por ausência. Para entregar $N$ posições, a folha precisa de $N/(1-a)$ pessoas, logo o quadro extra é
+\[ \text{extra} = N\,\frac{a}{1-a}. \]
+A folga da escala não é ausência: ela já está na definição de posição.
+
+\textbf{Três blocos, três tratamentos.}
+\begin{itemize}
+\item \textbf{Férias (planejada):} taxa entre quem tem 1 ano de casa ou mais (8,0\% a 8,4\% da carga), multiplicada pela parcela do quadro com direito. Essa parcela é projetada mês a mês com o risco de saída por tempo de casa da T1: rotatividade alta mantém muita gente sem direito a férias. Validação: na empresa 6, o mecanismo previu 4,3\% de férias em 2026 contra 4,6\% observados.
+\item \textbf{Afastamento prolongado} (INSS, acidente, licenças): nível médio, por ser um estado persistente.
+\item \textbf{Ausência curta imprevista} (faltas, atestados de até 15 dias, abonos): nível médio mais uma \emph{reserva} que cobre o dia com 95\% de nível de serviço,
+\[ a_{\text{curta}} = \mu + z_{0,95}\sqrt{\sigma^2_{\text{comum}} + \mu(1-\mu)/N}, \]
+em que $\sigma^2_{\text{comum}}$ é o choque comum a todos (dias ruins) e o segundo termo é a variação binomial. A reserva soma $\sim$2,5 p.p.
+\end{itemize}
+
+\textbf{Células sem dado.} Cada célula empresa $\times$ grupo combina sua taxa com a referência geral por credibilidade, com peso $n/(n+100)$, em que $n$ é o número de integrantes com ponto. A empresa 5 recebe só a referência.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrrrl}
+\toprule
+Empresa & Ativos oper. & Ano 1 & Ano 3 & Faixa (ano 3) & Pessoas\textsuperscript{*} & Confiança \\
+\midrule
+5 & 2.824 & 21,6\% & 21,7\% & 14,1\% a 30,2\% & 503 & baixa (sem dado próprio) \\
+8 & 978 & 20,1\% & 19,8\% & 14,2\% a 26,1\% & 162 & média-baixa \\
+6 & 760 & 18,0\% & 18,7\% & 16,2\% a 21,4\% & 118 & alta \\
+3 & 113 & 14,8\% & 16,6\% & 14,6\% a 18,6\% & 16 & média \\
+7 & 45 & 32,6\% & 33,8\% & 25,3\% a 43,8\% & 11 & baixa \\
+4 & 7 & 27,1\% & 32,7\% & 30,9\% a 34,6\% & 2 & muito baixa \\
+\midrule
+Total & 4.727 & & & & 811 & \\
+\bottomrule
+\end{tabular}
+\caption{Quadro extra para cobrir ausências, em \% das posições (reserva pela regra de 95\%). Nas empresas 5 e 8, a faixa propaga o erro de extrapolação medido ($\pm$1 RMSE) às células sem dado próprio. \textsuperscript{*}Integrantes da folha atual que cobrem ausências ($F \times a$, modelo integrado): dos 4.727 ativos, 811 existem para cobrir férias, afastamentos e faltas.}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[ybar stacked, width=0.9\linewidth, height=5.2cm, bar width=18pt, ymin=0, ymax=30,
+  symbolic x coords={5,8,6,3,7}, xtick=data, xticklabel={Empresa \tick},
+  ylabel={\% da carga perdida}, legend style={font=\footnotesize, at={(0.5,-0.2)}, anchor=north, draw=none, fill=none, legend columns=4, /tikz/every even column/.append style={column sep=8pt}},
+  tick label style={font=\footnotesize}, label style={font=\footnotesize}, axis x line*=bottom, axis y line*=left, ymajorgrids, grid style={black!10}, area legend]
+\addplot[fill=azul, draw=white] coordinates {(5,7.6) (8,6.7) (6,4.6) (3,5.0) (7,6.2)};
+\addplot[fill=cinza!70, draw=white] coordinates {(5,4.4) (8,4.1) (6,5.4) (3,2.4) (7,5.0)};
+\addplot[fill=verde, draw=white] coordinates {(5,3.3) (8,3.2) (6,2.9) (3,2.9) (7,7.1)};
+\addplot[fill=laranja, draw=white] coordinates {(5,2.5) (8,2.6) (6,2.6) (3,3.5) (7,6.7)};
+\legend{{férias},{afastamento prolongado},{ausência curta (média)},{reserva (95\%)}}
+\end{axis}
+\end{tikzpicture}
+\caption{Composição da perda de carga por empresa (média dos 3 anos). Totais: 17,8\% (empresa 5), 16,6\% (8), 15,5\% (6), 13,8\% (3) e 25,0\% (7), que viram 21,6\%, 19,9\%, 18,4\%, 16,0\% e 33,4\% de quadro extra pela fórmula $a/(1-a)$. A empresa 6 tem menos férias (rotatividade alta: muita gente sem direito) e mais afastamento prolongado.}
+\end{figure}
+
+\textbf{Validação fora da amostra.} Estimando com 2025 e prevendo 2026, o erro médio é de 1,2 p.p. de perda (2,6 p.p. sem o ajuste por tempo de casa). Escondendo células observadas e extrapolando, o erro é de 5,4 p.p. (RMSE); por isso a faixa da tabela já propaga esse erro para as células sem dado próprio, e a da empresa 5 vai de 14\% a 30\%.
+
+\textbf{Reserva escolhida por custo.} A regra de 95\% não diz quanto custa errar. Reformulamos: num dia com taxa de ausência $p$, escalam-se $Q$ titulares e $R$ reservas; cada um falta com probabilidade $p$ (a reserva também falta), os presentes são $S\sim\text{Binomial}(Q+R,\,1-p)$ e os postos descobertos são $U=\max(0,Q-S)$. A distribuição de $p$ é a empírica dos 551 dias observados, que já contém o choque comum. Escolhemos o $R$ inteiro que minimiza o custo diário $R + k\,E[U]$, em que $k$ é o custo de um posto descoberto em pessoas-dia: $\sim$1,5 se for coberto com hora extra, $\sim$10 se gerar multa ou viagem não realizada.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+Empresa & $k=1{,}5$ (hora extra) & $k=3$ & $k=10$ (multa) & Regra de 95\% \\
+\midrule
+5 & 16,6\% & 17,7\% & 19,3\% & 21,6\% \\
+8 & 14,8\% & 16,0\% & 17,7\% & 19,9\% \\
+6 & 13,6\% & 14,8\% & 16,3\% & 18,4\% \\
+3 & 10,2\% & 11,3\% & 13,6\% & 16,0\% \\
+7 & 15,9\% & 22,5\% & 29,2\% & 33,4\% \\
+\midrule
+Postos-dia atendidos (empresas grandes) & 99,0\% & 99,5\% & 99,8\% & 99,9\% \\
+\bottomrule
+\end{tabular}
+\caption{Quadro extra para ausências (\% das posições, média dos 3 anos) com a reserva de menor custo esperado, conforme o custo $k$ de um posto descoberto.}
+\end{table}
+
+A regra de 95\% equivale a supor um posto descoberto mais caro que 10 pessoas-dia. Se a operação cobre o descoberto com hora extra, a reserva ótima cai para $\sim$2,5\% das posições e o quadro extra cai 4 a 6 p.p. nas empresas grandes: na empresa 5, de 21,6\% para 16,6\% ($\sim$116 pessoas), aceitando $\sim$1\% de postos-dia cobertos por hora extra. \textbf{O parâmetro que decide é o custo do posto descoberto no contrato.}
+
+\textbf{Ressalvas.} (i) 23,6\% dos dias marcados como férias no ponto estão em sequências de mais de 30 dias (75 vínculos, até 472 dias), o que não é férias pela CLT; a divisão entre blocos fica imprecisa, mas o total quase não muda, porque esses dias continuam sendo ausência. (ii) 13.211 dias programados sem batida, falta ou abono foram tratados como compensados; se fossem faltas, a empresa 6 subiria de $\sim$18\% para $\sim$25\%.
+
+\section{Trilha 3 --- Escala 6x1 para 5x2}\label{sec:t3}
+\textbf{Mecânica.} Para entregar o mesmo serviço, a folha varia na razão inversa da carga semanal por pessoa:
+\[ \frac{\text{folha nova}}{\text{folha atual}} = \frac{\text{horas semanais atuais}}{\text{horas semanais novas}}. \]
+
+\textbf{O que o ponto mostra.} Medimos, nos dias normais, o que cada escala realmente trabalha: \textbf{6x1 = 5,98 dias $\times$ 7h08 = 42,7 h/semana; 5x2 = 5,04 dias $\times$ 8h33 = 43,0 h/semana}. O 5x2 praticado hoje é a mesma carga semanal em cinco dias, não uma jornada menor. Por isso o adicional depende de uma decisão de contrato, e modelamos três cenários:
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lcrr}
+\toprule
+Cenário de jornada após a mudança & Fator de folha & População A & População B \\
+\midrule
+Jornada diária mantida (caso base) & 5,98/5 = 1,197 & \textbf{145} & 522 \\
+Limite semanal de 40 h & 44/40 = 1,10 & 74 & 265 \\
+Carga semanal mantida (dia mais longo) & 1,00 & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Integrantes a mais. A: 736 vínculos em 6x1 no cadastro (125 na empresa 6, 14 na 8, 6 na 7). B: inclui também as 1.917 tripulações de \emph{jornada mensal} (empresa 5) e \emph{revezamento} (empresa 8), supondo que operem em 6x1, o que os dados não confirmam.}
+\end{table}
+
+\begin{table}[htbp]
+\centering\small
+\resizebox{\linewidth}{!}{\begin{tabular}{lrrrrrr}
+\toprule
+& \multicolumn{3}{c}{População A (6x1 no cadastro)} & \multicolumn{3}{c}{População B (inclui jornada mensal e revezamento)} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}
+Empresa & Folha em 6x1 & + jornada mantida & + limite 40 h & Folha afetada & + jornada mantida & + limite 40 h \\
+\midrule
+6 & 634 & \textbf{124,8} & 63,4 & 634 & 124,8 & 63,4 \\
+8 & 70 & \textbf{13,8} & 7,0 & 807 & 158,8 & 80,7 \\
+7 & 30 & \textbf{5,9} & 3,0 & 30 & 5,9 & 3,0 \\
+5 & 1 & \textbf{0,2} & 0,1 & 1.181 & 232,4 & 118,1 \\
+4 & 1 & \textbf{0,2} & 0,1 & 1 & 0,2 & 0,1 \\
+3 & 0 & \textbf{0,0} & 0,0 & 0 & 0,0 & 0,0 \\
+\midrule
+Total & 736 & \textbf{144,8} & 73,6 & 2.653 & 522,1 & 265,3 \\
+\bottomrule
+\end{tabular}}
+\caption{Integrantes a mais por empresa com a mudança para 5x2 (no cenário de carga semanal mantida, o adicional é zero em todas). Intervalo bootstrap da jornada medida na empresa 6, caso base: 123,8 a 125,5.}
+\end{table}
+
+\textbf{Leitura.} No caso base, a empresa 6 precisa de +16\% de pessoas (634 em 6x1); nas empresas 5 e 8 o efeito é quase nulo na população A e chega a +8\% e +16\% na B. O intervalo bootstrap da jornada medida é estreito (124 a 126 na empresa 6): a incerteza relevante é de premissa, não de amostragem.
+
+\textbf{Rotatividade: uma estimativa.} Ajustamos um modelo de Poisson para a taxa mensal de desligamento dos 1.561 vínculos com ponto (meses de exposição como \emph{offset}, erros robustos), com a escala \emph{medida no ponto} (6x1 se $\ge$5,5 dias com jornada por semana; 5x2 se entre 4,5 e 5,5) e controles para empresa, grupo de função e tempo de casa abaixo de um ano. Para o total de saídas não há diferença (razão de taxas 6x1/5x2 $=0{,}81$; IC95\% 0,63 a 1,04). Para as \textbf{saídas voluntárias}, o 6x1 tem taxa \textbf{1,74 vez maior} (IC95\% 1,00 a 3,04; $p=0{,}052$). A divergência no total vem da mistura de empresas: \textbf{só na empresa 6}, onde as duas escalas convivem, o total também aponta para mais saídas no 6x1 (razão 1,16; IC95\% 0,71 a 1,90), e as voluntárias repetem a razão (1,75; IC95\% 0,80 a 3,84). Além disso, parte dos desligados passa a um horário 5x2 genérico pouco antes da saída (Seção 2), o que infla as saídas involuntárias contadas como 5x2. Há só 23 saídas voluntárias em 5x2, então a estimativa é imprecisa. É uma associação, não um efeito causal, e deve ser lida como indicativa, mas aponta na direção esperada: se o 5x2 eliminar esse excesso, as saídas voluntárias cairiam $\sim$43\%; na empresa 6, onde cerca de metade das saídas é voluntária, isso equivale a $\sim$20\% a menos de turnover.
+
+\textbf{Sensibilidade.} A escala 6x1 está concentrada nos motoristas de caminhão da empresa 6 (634 dos 736 vínculos), e a escala dos desligados é artefato de cadastro. Por isso o efeito causal da escala sobre o turnover não é identificável nos dados; tratamos como sensibilidade: com a mesma taxa, a folha maior gera mais saídas (+76 por ano na empresa 6); uma redução de 20\% na taxa, plausível com mais folgas, já compensa (--16 por ano), e uma de 30\% chega a --63.
+
+\section{Modelo integrado e custo}\label{sec:integrado}
+Com $a$ = perda por ausência (T2), $s$ = parcela da folha em 6x1, $f$ = fator de folha (T3), $T$ = turnover anual (T1) e 30 dias para repor uma saída (premissa):
+\[ \frac{\text{folha}}{\text{posição}} = \frac{1 + s\,(f-1)}{1-a}\left(1 + T\,\frac{\text{dias\_vaga}}{365}\right). \]
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrr|rr}
+\toprule
+& \multicolumn{4}{c|}{Por 100 posições (população A, caso base)} & \multicolumn{2}{c}{Operação atual (pessoas)} \\
+Empresa & Cobertura & Escala & Vagas & \textbf{Total} & Folha atual & Necessária \\
+\midrule
+5 & 21,6 & 0,0 & 1,0 & \textbf{122,7} & 2.824 & 2.848 \\
+8 & 19,9 & 1,7 & 2,8 & \textbf{124,4} & 978 & 1.015 \\
+6 & 18,4 & 19,4 & 6,9 & \textbf{144,8} & 760 & 929 \\
+3 & 16,0 & 0,0 & 3,1 & \textbf{119,2} & 113 & 116 \\
+7 & 33,4 & 17,5 & 1,7 & \textbf{152,6} & 45 & 51 \\
+4 & 30,5 & 3,7 & 3,0 & \textbf{137,2} & 7 & 7 \\
+\midrule
+Total & & & & & \textbf{4.727} & \textbf{4.967} \\
+\bottomrule
+\end{tabular}
+\caption{Folha necessária. Para a operação atual, os 4.727 ativos já incluem a cobertura de ausências (3.916 posições + 811 de cobertura); o acréscimo vem da escala (+145) e das vagas (+95).}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[ybar stacked, width=0.9\linewidth, height=5.2cm, bar width=18pt, ymin=0, ymax=58,
+  symbolic x coords={5,8,6,3,7,4}, xtick=data, xticklabel={Empresa \tick},
+  ylabel={pessoas a mais por 100 posições}, legend style={font=\footnotesize, at={(0.5,-0.2)}, anchor=north, draw=none, fill=none, legend columns=3, /tikz/every even column/.append style={column sep=8pt}},
+  tick label style={font=\footnotesize}, label style={font=\footnotesize}, axis x line*=bottom, axis y line*=left, ymajorgrids, grid style={black!10}]
+\addplot[fill=azul, draw=white] coordinates {(5,21.6) (8,19.9) (6,18.4) (3,16.0) (7,33.4) (4,30.5)};
+\addplot[fill=laranja, draw=white] coordinates {(5,0.0) (8,1.7) (6,19.4) (3,0.0) (7,17.5) (4,3.7)};
+\addplot[fill=verde, draw=white] coordinates {(5,1.0) (8,2.8) (6,6.9) (3,3.1) (7,1.7) (4,3.0)};
+\legend{{cobertura de ausências (T2)},{mudança de 6x1 para 5x2 (T3)},{vagas por rotatividade (T1)}}
+\end{axis}
+\end{tikzpicture}
+\caption{Quanto cada trilha acrescenta à folha, por 100 posições (população A, caso base). Totais: 122,7 (empresa 5), 124,4 (8), 144,8 (6), 119,2 (3), 152,6 (7) e 137,2 (4). A cobertura de ausências pesa em todas as empresas; a mudança de escala só onde há 6x1.}
+\end{figure}
+
+\textbf{Custo.} Com o salário de referência de cada empresa, a folha atual (4.727 pessoas) custa cerca de R\$ 145 milhões por ano (R\$ 247 milhões com encargos de 1,7, premissa); a folha necessária (4.967 pessoas), R\$ 151 e R\$ 257 milhões. \textbf{O acréscimo sobre a folha atual é de +240 pessoas, cerca de R\$ 10 milhões por ano com encargos, ou R\$ 30 milhões em três anos} (4,1\% da folha atual): R\$ 17 milhões pela mudança de escala e R\$ 13 milhões pelas vagas. A cobertura de ausências (R\$ 128 milhões em três anos) já existe e já é paga hoje; ela é o principal componente do preço de um contrato novo, mas não é custo adicional para a operação atual.
+
+\textbf{Sensibilidade (por 100 posições).} As premissas que mais movem o resultado são: a escala real das tripulações (população B: +10 na empresa 5, +18 na 8); a jornada após a mudança (limite de 40 h: --10 na empresa 6; carga mantida: --20); e a extrapolação das ausências da empresa 5 ($\pm1\sigma$: --7,6 a +8,7, cerca de $\pm$R\$ 11 milhões por ano). O prazo de reposição (15 a 60 dias) move de --3,5 a +6,9 na empresa 6.
+
+\section{Recomendações e limitações}
+\begin{enumerate}
+\item \textbf{Para precificar:} usar por empresa o total por 100 posições da tabela integrada (que adota a regra de 95\%, conservadora); na empresa 6, a parte alta da faixa de turnover.
+\item \textbf{Definir o custo do posto descoberto:} se o contrato admite cobrir com hora extra, a reserva por custo reduz o quadro extra em 4 a 6 p.p. ($\sim$R\$ 7 milhões por ano com encargos, só na empresa 5).
+\item \textbf{Antes de assinar:} confirmar com a operação a escala real das tripulações das empresas 5 e 8 e a jornada pós-mudança; é o que separa +145 de +522 pessoas.
+\item \textbf{Dado que mais vale a pena coletar:} o ponto da empresa 5, que responde por 60\% do quadro e por $\sim\pm$R\$ 11 milhões/ano de incerteza.
+\item \textbf{Gestão:} o pico de saídas no 3.\textsuperscript{o} mês e a ligação entre rotatividade e férias mostram que reter nos primeiros meses reduz duas contas ao mesmo tempo (vagas e faltas).
+\end{enumerate}
+\textbf{Limitações:} taxas constantes por três anos, sem reajuste nem inflação; folha atual tratada como bem dimensionada; aprendizes fora; 76\% do quadro operacional sem dado próprio; efeito da escala sobre a rotatividade não identificado.
+
+\section*{Reprodutibilidade: o código e como executá-lo}
+\textbf{O código enviado é um único arquivo, \texttt{solucao\_datathon.py}}, que reproduz todas as tabelas e números deste relatório a partir dos CSVs fornecidos. Cada etapa traz, como comentário, a explicação do que faz e por quê. O arquivo está organizado em partes:
+\begin{itemize}
+\item \textbf{A.} Funções reutilizáveis (rotatividade, ausências, escala, modelo integrado, bayes empírico, reserva por custo e modelo de Poisson) e a \textbf{auditoria dos dados} (os números da Seção 2);
+\item \textbf{B.} Trilha 1: série mensal, diagnóstico, backtest de estratégias e projeção;
+\item \textbf{C.} Trilha 2: classificação e limpeza do ponto, taxas por causa, validação fora da amostra, reserva e quadro extra;
+\item \textbf{D.} Trilha 3: jornada praticada por escala, cenários e quadro adicional;
+\item \textbf{E.} Modelo integrado: as três trilhas numa base única (a posição) e o custo em reais;
+\item \textbf{F.} Extensões: faixas da T1 validadas fora da amostra, estimador bayesiano empírico, reserva por custo esperado e efeito da escala sobre a rotatividade.
+\end{itemize}
+
+\textbf{Como executar.}
+\begin{enumerate}
+\item Python 3.10 ou superior. Instalar as dependências (o \texttt{matplotlib} é opcional):\\ \texttt{pip install pandas numpy scipy statsmodels}
+\item Colocar os 14 CSVs fornecidos numa pasta \texttt{dados/}, ao lado do arquivo.
+\item Executar \texttt{python solucao\_datathon.py} (cerca de 2 minutos).
+\item As tabelas são gravadas em \texttt{resultados/} (18 arquivos CSV) e os resultados intermediários aparecem na tela. Com o \texttt{matplotlib} instalado, os gráficos são salvos em \texttt{figuras/}.
+\end{enumerate}
+
+\textbf{Premissas parametrizadas.} As escolhas que não vêm dos dados estão declaradas no código e podem ser alteradas: encargos de 1,7 sobre o salário, 30 dias para repor uma saída, nível de serviço de 95\% (ou o custo $k$ do posto descoberto), peso de credibilidade $n/(n+100)$ e a data de corte (30/09/2026).
+
+\textbf{Verificação.} O arquivo foi executado do zero, numa pasta limpa, e as 18 tabelas que ele gera são idênticas às usadas neste relatório. A mesma análise, com gráficos e texto, está nos notebooks do repositório \url{https://github.com/ubiratanpaniago/Datathon-EnGOPE}.
+
+\end{document}
