@@ -168,7 +168,7 @@ def participacao_elegivel(tempo_meses, risco_faixa, meses=36):
     quem sai é reposto por uma contratação nova (tempo de casa zero). Liga a Trilha 2 à Trilha 1:
     alta rotatividade mantém muita gente abaixo de 1 ano, que ainda não tira férias.
     """
-    from rotatividade import FAIXAS_TEMPO_CASA
+    from rotatividade import FAIXAS_TEMPO_CASA, envelhecer
     faixa = np.searchsorted(FAIXAS_TEMPO_CASA[1:], np.arange(200), side='left')
     h = risco_faixa[faixa]
     n = np.bincount(np.minimum(np.asarray(tempo_meses, dtype=int), 199), minlength=200).astype(float)
@@ -176,5 +176,5 @@ def participacao_elegivel(tempo_meses, risco_faixa, meses=36):
     for _ in range(meses):
         saida.append(n[12:].sum() / n.sum())
         sai = n * h
-        n = np.concatenate([[sai.sum()], (n - sai)[:-1]])
+        n = envelhecer(n - sai, sai.sum())
     return np.array(saida)

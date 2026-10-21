@@ -11,7 +11,7 @@ O desafio é estimar o preço de um contrato de 3 anos do Grupo HP. Cada trilha 
 | **T1** Rotatividade | quanto de turnover por empresa nos 3 anos? | de ~10% (empresa 5) a ~61% (empresa 6), com faixa de incerteza por empresa |
 | **T2** Folguistas e feristas | quantos a mais para cobrir ausências? | de ~16% a ~22% das posições nas empresas grandes |
 | **T3** Escala 6x1 para 5x2 | quantos a mais se a escala mudar? | de **0 a +20%** da folha em 6x1, conforme a jornada; **145 pessoas** no caso base |
-| **Integrado** | quanto vale tudo isso em pessoas e em R$? | folha atual de 4.727 vai a ~4.967 pessoas; custo adicional de ~R$ 158 milhões em 3 anos |
+| **Integrado** | quanto vale tudo isso em pessoas e em R$? | folha atual de 4.727 vai a ~4.967 pessoas (+240); acréscimo de ~R$ 30 milhões em 3 anos sobre a folha atual |
 
 **O que mais limita o resultado não é a técnica, é o dado:** 76% do quadro operacional (toda a empresa 5 e os ônibus da empresa 8) não tem ponto nem afastamentos.
 
@@ -36,17 +36,19 @@ Os 14 CSVs têm o cadastro de 20.001 vínculos, o ponto diário (601.474 linhas)
 3. **Backtest de origem móvel**: projetar 12, 24 e 36 meses e comparar com o realizado, para 8 estratégias simples e para um modelo de coortes por tempo de casa.
 4. Escolha: **média dos últimos 36 meses** por empresa, com faixa calibrada pelo backtest e limitada por um teto. Ela empata com as demais médias (erro de ~6,2 a ~6,9 p.p.), é a melhor no regime recente e a mais simples. O modelo de coortes **não superou** a média.
 
-**Resultado** (turnover anual, faixa para os 3 anos):
+**Resultado** (turnover mensal anualizado, isto é, a fórmula do enunciado aplicada a cada mês × 12; faixa para os 3 anos):
 
 | Empresa | Base | Faixa | Confiança |
 |---|---|---|---|
 | 5 | 10,2% | 10,0% a 12,8% | alta |
 | 8 | 28,5% | 28,5% a 34,5% | média-alta |
-| 6 | 61,1% | 61,1% a 72,1% | baixa |
+| 6 | 61,1% | 61,1% a 71,0% | baixa |
 | 3 | 32,8% | 20,7% a 41,1% | média-baixa |
-| 7 | 13,6% | 13,6% a 25,0% | média |
+| 7 | 13,6% | 13,6% a 24,5% | média |
 | 4 | 27,0% | 20,4% a 46,4% | baixa (7 pessoas) |
 | 1 | sem projeção (sem vínculos ativos) | | |
+
+**Atenção à definição.** A mesma fórmula do enunciado aplicada a **um ano inteiro** dá valores menores, porque o headcount passa a incluir todos que passaram pela empresa no ano: empresa 6 = 42,5% em 2024 e 27,6% em 2025; empresa 8 = 22,4% e 21,9%; empresa 5 = 10,1% e 8,4% (`resultados/trilha1_turnover_definicoes.csv`). Aplicada à janela inteira de 36 meses (o horizonte do contrato), dá 60,9% na empresa 6, 47,6% na 8 e 23,4% na 5.
 
 A empresa 6 é imprevisível (erro do backtest de 26 a 28 p.p. em 36 meses): o turnover dela depende de ganhar ou perder contratos.
 
@@ -56,7 +58,7 @@ A empresa 6 é imprevisível (erro do backtest de 26 a 28 p.p. em 36 meses): o t
 
 1. Perda de carga = fração do trabalho programado que não é entregue por ausência. Quadro extra por posição = `perda / (1 − perda)`.
 2. A perda foi dividida em **três blocos**, cada um com seu tratamento:
-   - **férias:** taxa entre quem tem 1 ano de casa ou mais (8,0% a 8,4%, igual aos 30 dias por ano da lei), multiplicada pela parcela do quadro com esse direito, projetada com o modelo de risco por tempo de casa da Trilha 1;
+   - **férias:** taxa entre quem tem 1 ano de casa ou mais (8,0% a 8,4%, próximo dos 30 dias por ano da lei, mas 23,6% dos dias marcados como férias no ponto estão em sequências de mais de 30 dias, o que indica afastamentos longos registrados como férias), multiplicada pela parcela do quadro com esse direito, projetada com o modelo de risco por tempo de casa da Trilha 1;
    - **afastamento prolongado** (INSS, acidente, licenças): nível médio;
    - **ausência curta imprevista** (faltas, atestados, abonos): nível médio mais uma **reserva** calibrada pela variabilidade diária, para 95% de nível de serviço (~2,5 p.p. acima da média).
 3. Limpeza do ponto (seção 2 acima) e exclusão dos aprendizes (229 ativos, que têm 27% a 35% de abono por horas de estudo).
@@ -67,10 +69,10 @@ A empresa 6 é imprevisível (erro do backtest de 26 a 28 p.p. em 36 meses): o t
 | Empresa | Ano 1 | Ano 3 | Confiança |
 |---|---|---|---|
 | 5 | 21,6% | 21,7% | baixa (nenhum dado próprio) |
-| 8 | 19,7% | 19,4% | média-baixa |
-| 6 | 17,9% | 18,6% | alta |
+| 8 | 20,1% | 19,8% | média-baixa |
+| 6 | 18,0% | 18,7% | alta |
 | 3 | 14,8% | 16,6% | média |
-| 7 | 32,2% | 33,7% | baixa |
+| 7 | 32,6% | 33,8% | baixa |
 | 4 | 27,1% | 32,7% | muito baixa |
 
 **Validação** (seção 3b do notebook): estimando com 2025 e prevendo 2026, o método erra em média **1,2 p.p.** de perda (2,6 p.p. sem o ajuste de tempo de casa). Já **a extrapolação para células sem dado erra 5,4 p.p.** (RMSE), o que mostra que a faixa baixo–alto da Trilha 2 é estreita demais para a empresa 5.
@@ -105,8 +107,8 @@ em que `a` é a perda por ausência (T2), `s` e `f` são a parcela em 6x1 e o fa
 **Resultado:**
 
 - **Por 100 posições**, a folha tem de ter 123 (empresa 5), 124 (empresa 8) e 145 (empresa 6) pessoas, no caso base.
-- **Operação atual:** os 4.727 do quadro ativo se decompõem em 3.918 posições e 809 de cobertura. Com a mudança de escala e as vagas por rotatividade, a folha necessária vai a **4.967 (+240, ou +5,1%)**.
-- **Custo** (salário de referência × 12): R$ 151 milhões por ano só de salário, ou R$ 257 milhões com encargos de 1,7. O custo adicional de T1, T2 e T3 em 3 anos é de cerca de **R$ 158 milhões**: cobertura de ausências R$ 127 milhões, mudança de escala R$ 17 milhões e vagas R$ 13 milhões.
+- **Operação atual:** os 4.727 do quadro ativo se decompõem em 3.916 posições e 811 de cobertura. Com a mudança de escala e as vagas por rotatividade, a folha necessária vai a **4.967 (+240, ou +5,1%)**.
+- **Custo** (salário de referência × 12): R$ 151 milhões por ano só de salário, ou R$ 257 milhões com encargos de 1,7. **O acréscimo sobre a folha atual é de cerca de R$ 10 milhões por ano, ou R$ 30 milhões em 3 anos** (+240 pessoas: mudança de escala R$ 17 milhões e vagas R$ 13 milhões em 3 anos). O custo da cobertura de ausências (R$ 128 milhões em 3 anos) **já está dentro da folha atual** e não é custo novo; somado aos outros dois, dá ~R$ 158 milhões acima do custo das posições puras.
 
 ## 7. As trilhas se relacionam?
 
@@ -116,7 +118,7 @@ Sim, e o modelo integrado torna isso explícito, mas a ligação tem graus difer
 - **T2 para T3 (composição):** a folha da T3 já contém a cobertura de ausências, então o fator de escala a multiplica.
 - **T1 para T3 (sensibilidade):** a folha maior gera mais saídas e vagas, mas é efeito de segunda ordem.
 
-Uma inconsistência foi encontrada e corrigida: a T2 tratava o quadro ativo como *posições* e a T3 como *folha*. No modelo integrado, a T2 passa a medir a cobertura dentro da folha (809 pessoas, e não 977).
+Uma inconsistência foi encontrada e corrigida: a T2 tratava o quadro ativo como *posições* e a T3 como *folha*. No modelo integrado, a T2 passa a medir a cobertura dentro da folha (811 pessoas, e não 975).
 
 ## 8. O que mais pesa na incerteza
 
@@ -142,6 +144,15 @@ Duas premissas nossas, que não vêm dos dados e estão como parâmetros: **30 d
 - **Relatório em PDF de até 10 páginas** (obrigatório, a falta desclassifica) e envio por e-mail com o código, até 21/10 às 19h00.
 - Corrigir a faixa da T2 para células sem dado, dentro da própria trilha.
 - Dúvidas à organização: o que é a `META` em `dim_meta`, a escala real das tripulações das empresas 5 e 8, e a jornada pós-mudança.
+
+## 10b. Correções de 21/10/2026 (revisão)
+
+Os notebooks foram reexecutados do zero e reproduzem os CSVs. A revisão encontrou e corrigiu:
+
+1. **Bug na simulação por tempo de casa** (`simular_coorte` e `participacao_elegivel`): quem tinha 199 meses de casa ou mais saía do quadro sem ser contado como desligamento. Agora o último compartimento é absorvente (`rotatividade.envelhecer`). Efeito: T2 da empresa 8 +0,4 p.p. (19,7% → 20,1%), empresas 6 e 7 até +0,5 p.p.; teto da faixa da T1 da empresa 6 de 72,1% para 71,0%. A projeção-base da T1, a T3 e o total de 4.967 pessoas não mudam.
+2. **Definição do turnover:** o valor projetado é o turnover mensal anualizado. A fórmula aplicada a um ano inteiro dá valores menores; as duas estão em `resultados/trilha1_turnover_definicoes.csv`.
+3. **Leitura do custo:** os R$ 158 milhões eram o custo acima das posições puras, não o aumento sobre a folha atual. O acréscimo real é de ~R$ 30 milhões em 3 anos (`resultados/integrado_acrescimo_folha_atual.csv`).
+4. **Férias:** 23,6% dos dias `F` do ponto estão em sequências de mais de 30 dias (75 vínculos, máximo de 472 dias). A taxa próxima de 8,2% não valida o modelo de férias; o quadro total quase não muda, porque esses dias continuam sendo ausência.
 
 ## 11. Mapa dos arquivos
 

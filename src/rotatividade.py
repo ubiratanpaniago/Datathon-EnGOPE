@@ -46,7 +46,11 @@ def turnover_janela(janela):
 
 
 def taxa_anual(historico, meses):
-    """Turnover anual equivalente, estimado como a taxa mensal agregada dos últimos `meses` × 12."""
+    """Turnover mensal anualizado: taxa mensal agregada dos últimos `meses` × 12.
+
+    Usa o headcount de cada mês. Não é a fórmula do enunciado aplicada a um ano inteiro (ver
+    `turnover_periodo`), que usa como denominador todos os vínculos do ano e dá valores menores.
+    """
     w = historico.tail(meses)
     return (w.adm + w.resc).sum() / 2 / w.hc.sum() * 100 * 12
 
@@ -96,5 +100,26 @@ def simular_coorte(integrantes, historico, empresa, origem, risco, meses=12, adm
         sai = n * h
         adm = sai.sum() if adm_mensal is None else adm_mensal
         saida.append((adm, sai.sum(), n.sum() + adm))
-        n = np.concatenate([[adm], (n - sai)[:-1]])
+        n = envelhecer(n - sai, adm)
     return pd.DataFrame(saida, columns=['adm', 'resc', 'hc'])
+
+
+def envelhecer(n, entradas):
+    """Avança um mês de casa: entradas vão para o compartimento 0; o último (199+ meses) acumula quem chega a ele."""
+    novo = np.concatenate([[entradas], n[:-1]])
+    novo[-1] += n[-1]
+    return novo
+
+
+def turnover_periodo(integrantes, empresa, inicio, fim):
+    """Turnover (%) pela fórmula do enunciado aplicada ao período inteiro [inicio, fim].
+
+    Headcount = vínculos com algum dia de vínculo no período. Para um ano, o denominador inclui todos os
+    que passaram pela empresa no ano, e o valor fica abaixo da taxa mensal anualizada (`taxa_anual`).
+    """
+    ini, fim = pd.Timestamp(inicio), pd.Timestamp(fim)
+    g = integrantes[integrantes.CODCOLIGADA == empresa]
+    adm = g.DATAADMISSAO.between(ini, fim).sum()
+    resc = g.DATADEMISSAO.between(ini, fim).sum()
+    hc = ((g.DATAADMISSAO <= fim) & (g.DATADEMISSAO.isna() | (g.DATADEMISSAO >= ini))).sum()
+    return np.nan if not hc else (adm + resc) / 2 / hc * 100
