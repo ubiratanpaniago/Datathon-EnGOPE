@@ -1,6 +1,6 @@
-# Versões com as quais os notebooks foram executados (Python 3.13)
+# Testado com Python 3.11 e 3.13
 pandas>=3.0
-numpy>=2.5
+numpy>=2.2
 matplotlib>=3.10
 duckdb>=1.5          # usado no notebook 01 (perfil dos dados)
 scipy>=1.11
